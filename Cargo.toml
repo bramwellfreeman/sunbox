@@ -1,0 +1,31 @@
+[package]
+name = "crayon-box-term"
+version = "0.1.0"
+edition = "2021"
+description = "Crayon Box Email for the terminal — Gmail TUI + CLI + MCP server built for AI agents"
+
+[[bin]]
+name = "crayon"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.28"
+dirs = "5"
+html2text = "0.12"
+rand = "0.8"
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+toml = "0.8"
+ureq = { version = "2.10", features = ["json"] }
+urlencoding = "2"
+
+[profile.release]
+strip = true
+lto = "thin"
