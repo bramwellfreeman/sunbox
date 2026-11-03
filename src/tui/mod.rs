@@ -45,17 +45,23 @@ enum InputKind {
     Label,
 }
 
-/// A message written in $EDITOR, waiting for y/d/n.
-struct Pending {
-    req: SendReq,
-    preview: String,
+/// The in-app compose window.
+struct ComposeForm {
+    title: String,
+    /// to, cc, bcc, subject, body
+    fields: [String; 5],
+    focus: usize,
+    reply_to: Option<String>,
+    armed_discard: bool,
 }
+
+const FIELD_NAMES: [&str; 5] = ["To", "Cc", "Bcc", "Subject", ""];
 
 enum Overlay {
     None,
+    Compose(ComposeForm),
     Help,
     Templates { items: Vec<Template>, sel: usize, reply_to: Option<String> },
-    Confirm(Pending),
     Input { kind: InputKind, buf: String },
 }
 
@@ -129,7 +135,17 @@ fn main_loop(term: &mut ratatui::DefaultTerminal, app: &mut App, rx: &Receiver<M
             enable_raw_mode()?;
             term.clear()?;
             match edited {
-                Ok(Some(p)) => app.overlay = Overlay::Confirm(p),
+                Ok(Some(p)) => {
+                    let title = if p.reply_to_thread.is_some() { " Reply " } else { " New message " };
+                    let r = p;
+                    app.overlay = Overlay::Compose(ComposeForm {
+                        title: title.into(),
+                        fields: [r.to, r.cc, r.bcc, r.subject, r.body],
+                        focus: 4,
+                        reply_to: r.reply_to_thread,
+                        armed_discard: false,
+                    });
+                }
                 Ok(None) => app.status = "Discarded empty message".into(),
                 Err(err) => app.status = format!("Error: {err:#}"),
             }
@@ -258,6 +274,10 @@ impl App {
         }
         match std::mem::replace(&mut self.overlay, Overlay::None) {
             Overlay::None => {}
+            Overlay::Compose(form) => {
+                self.compose_key(form, k);
+                return;
+            }
             Overlay::Help => return,
             Overlay::Input { kind, mut buf } => {
                 match k.code {
@@ -289,33 +309,10 @@ impl App {
                     KeyCode::Enter => {
                         if let Some(t) = items.get(sel).cloned() {
                             let req = SendReq { reply_to_thread: reply_to, ..Default::default() };
-                            self.job = Some(EditorJob::Compose { req, template: Some(t) });
+                            self.open_compose(req, Some(t));
                         }
                     }
                     _ => self.overlay = Overlay::Templates { items, sel, reply_to },
-                }
-                return;
-            }
-            Overlay::Confirm(p) => {
-                match k.code {
-                    KeyCode::Char('y') | KeyCode::Char('Y') => {
-                        self.status = "Sending…".into();
-                        let req = p.req;
-                        self.spawn(move |e| Msg::Done { status: e.send(&Actor::User, &req).map(|_| "Sent".into()), reload: true });
-                    }
-                    KeyCode::Char('d') | KeyCode::Char('D') => {
-                        self.status = "Saving draft…".into();
-                        let req = p.req;
-                        self.spawn(move |e| Msg::Done {
-                            status: e.draft(&Actor::User, &req).map(|_| "Draft saved".into()),
-                            reload: false,
-                        });
-                    }
-                    KeyCode::Char('e') | KeyCode::Char('E') => {
-                        self.job = Some(EditorJob::Compose { req: p.req, template: None });
-                    }
-                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => self.status = "Discarded".into(),
-                    _ => self.overlay = Overlay::Confirm(p),
                 }
                 return;
             }
@@ -329,7 +326,7 @@ impl App {
                 return;
             }
             KeyCode::Char('c') => {
-                self.job = Some(EditorJob::Compose { req: SendReq::default(), template: None });
+                self.open_compose(SendReq::default(), None);
                 return;
             }
             KeyCode::Char('/') => {
@@ -347,10 +344,7 @@ impl App {
             let id = t.id.clone();
             match k.code {
                 KeyCode::Char('r') => {
-                    self.job = Some(EditorJob::Compose {
-                        req: SendReq { reply_to_thread: Some(id), ..Default::default() },
-                        template: None,
-                    });
+                    self.open_compose(SendReq { reply_to_thread: Some(id), ..Default::default() }, None);
                     return;
                 }
                 KeyCode::Char('T') => {
@@ -370,7 +364,7 @@ impl App {
                             .map(|m| format!("\n\n---------- Forwarded message ---------\nFrom: {}\nDate: {}\nSubject: {}\nTo: {}\n\n{}", m.from, fmt_date(m.date, true), m.subject, m.to, m.body))
                             .unwrap_or_default();
                         let req = SendReq { subject: format!("Fwd: {}", detail.subject), body: quoted, ..Default::default() };
-                        self.job = Some(EditorJob::Compose { req, template: None });
+                        self.open_compose(req, None);
                     } else {
                         self.status = "Open the thread first (Enter), then f to forward".into();
                     }
@@ -503,28 +497,185 @@ impl App {
         }
     }
 
+    /// Resolve recipients/subject/template so the composer shows the real message.
+    fn prefill(&self, req: &SendReq) -> Result<(String, String, String, String)> {
+        if req.reply_to_thread.is_none() && req.template.is_none() {
+            return Ok((req.to.clone(), req.cc.clone(), req.subject.clone(), req.body.clone()));
+        }
+        let mut probe = req.clone();
+        if probe.body.is_empty() && probe.template.is_none() {
+            probe.body = " ".into();
+        }
+        if probe.to.is_empty() && probe.reply_to_thread.is_none() {
+            probe.to = "recipient@example.com".into();
+        }
+        let c = self.e.compose(&probe)?;
+        let to = if req.to.is_empty() && req.reply_to_thread.is_none() { String::new() } else { c.to };
+        Ok((to, c.cc, c.subject, c.body.trim().to_string()))
+    }
+
+    fn open_compose(&mut self, mut req: SendReq, template: Option<Template>) {
+        if let Some(t) = &template {
+            req.template = Some(t.name.clone());
+        }
+        let title = match (&req.reply_to_thread, &template, req.subject.starts_with("Fwd:")) {
+            (_, Some(t), _) => format!(" Reply · template “{}” ", t.name),
+            (Some(_), None, _) => " Reply ".to_string(),
+            (None, None, true) => " Forward ".to_string(),
+            _ => " New message ".to_string(),
+        };
+        match self.prefill(&req) {
+            Ok((to, cc, subject, body)) => {
+                let focus = if to.is_empty() { 0 } else if subject.is_empty() { 3 } else { 4 };
+                self.overlay = Overlay::Compose(ComposeForm {
+                    title,
+                    fields: [to, cc, String::new(), subject, body],
+                    focus,
+                    reply_to: req.reply_to_thread,
+                    armed_discard: false,
+                });
+            }
+            Err(e) => self.status = format!("Error: {e:#}"),
+        }
+    }
+
+    fn compose_key(&mut self, mut form: ComposeForm, k: KeyEvent) {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let req = |f: &ComposeForm| SendReq {
+            to: f.fields[0].trim().to_string(),
+            cc: f.fields[1].trim().to_string(),
+            bcc: f.fields[2].trim().to_string(),
+            subject: f.fields[3].trim().to_string(),
+            body: f.fields[4].clone(),
+            reply_to_thread: f.reply_to.clone(),
+            ..Default::default()
+        };
+        if k.code != KeyCode::Esc {
+            form.armed_discard = false;
+        }
+        match k.code {
+            KeyCode::Char('s') if ctrl => {
+                if form.fields[0].trim().is_empty() || form.fields[4].trim().is_empty() {
+                    self.status = "Need a recipient and a message before sending".into();
+                    self.overlay = Overlay::Compose(form);
+                    return;
+                }
+                self.status = "Sending…".into();
+                let r = req(&form);
+                self.spawn(move |e| Msg::Done { status: e.send(&Actor::User, &r).map(|_| "Sent".into()), reload: true });
+            }
+            KeyCode::Char('d') if ctrl => {
+                self.status = "Saving draft…".into();
+                let r = req(&form);
+                self.spawn(move |e| Msg::Done { status: e.draft(&Actor::User, &r).map(|_| "Draft saved".into()), reload: false });
+            }
+            KeyCode::Char('e') if ctrl => {
+                self.job = Some(EditorJob::Compose { req: req(&form), template: None });
+            }
+            KeyCode::Esc => {
+                let empty = form.fields[4].trim().is_empty();
+                if empty || form.armed_discard {
+                    self.status = "Discarded".into();
+                } else {
+                    form.armed_discard = true;
+                    self.status = "Press Esc again to discard, Ctrl+D to save a draft".into();
+                    self.overlay = Overlay::Compose(form);
+                }
+                return;
+            }
+            KeyCode::Tab | KeyCode::Down if form.focus < 4 || k.code == KeyCode::Tab => {
+                form.focus = (form.focus + 1) % 5;
+                self.overlay = Overlay::Compose(form);
+            }
+            KeyCode::BackTab | KeyCode::Up if form.focus < 4 || k.code == KeyCode::BackTab => {
+                form.focus = (form.focus + 4) % 5;
+                self.overlay = Overlay::Compose(form);
+            }
+            KeyCode::Enter => {
+                if form.focus == 4 {
+                    form.fields[4].push('\n');
+                } else {
+                    form.focus += 1;
+                }
+                self.overlay = Overlay::Compose(form);
+            }
+            KeyCode::Backspace => {
+                if ctrl {
+                    let f = &mut form.fields[form.focus];
+                    while f.ends_with(char::is_whitespace) {
+                        f.pop();
+                    }
+                    while f.chars().last().is_some_and(|c| !c.is_whitespace()) {
+                        f.pop();
+                    }
+                } else {
+                    form.fields[form.focus].pop();
+                }
+                self.overlay = Overlay::Compose(form);
+            }
+            KeyCode::Char(c) if !ctrl => {
+                form.fields[form.focus].push(c);
+                self.overlay = Overlay::Compose(form);
+            }
+            _ => self.overlay = Overlay::Compose(form),
+        }
+    }
+
+    fn draw_compose(&self, f: &mut Frame, form: &ComposeForm) {
+        let area = f.area();
+        let w = area.width.saturating_sub(4).min(100);
+        let h = area.height.saturating_sub(2);
+        let r = Rect { x: area.x + (area.width - w) / 2, y: area.y + 1, width: w, height: h };
+        f.render_widget(Clear, r);
+        let block = popup(&form.title).title_bottom(
+            Line::from(" Ctrl+S send · Ctrl+D save draft · Ctrl+E open in $EDITOR · Tab next field · Esc discard ")
+                .fg(MUTED),
+        );
+        let inner = block.inner(r);
+        f.render_widget(block, r);
+        let [hdr, sep, body] =
+            Layout::vertical([Constraint::Length(4), Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
+        let cursor = Span::styled("▏", Style::new().fg(CRAYON));
+        let header: Vec<Line> = (0..4)
+            .map(|i| {
+                let focused = form.focus == i;
+                let label = Span::styled(
+                    format!("{:>8}  ", FIELD_NAMES[i]),
+                    if focused { Style::new().fg(CRAYON).bold() } else { Style::new().fg(MUTED) },
+                );
+                let mut l = vec![label, Span::raw(form.fields[i].clone())];
+                if focused {
+                    l.push(cursor.clone());
+                }
+                Line::from(l)
+            })
+            .collect();
+        f.render_widget(Paragraph::new(header), hdr);
+        f.render_widget(Paragraph::new("─".repeat(sep.width as usize)).fg(Color::Rgb(60, 60, 66)), sep);
+        let mut lines: Vec<Line> = form.fields[4].split('\n').map(|l| Line::raw(l.to_string())).collect();
+        if form.focus == 4 {
+            if let Some(last) = lines.last_mut() {
+                last.spans.push(cursor);
+            }
+        }
+        if form.fields[4].is_empty() && form.focus != 4 {
+            lines = vec![Line::from(Span::styled("Write your message…", Style::new().fg(MUTED)))];
+        }
+        let para = Paragraph::new(lines).wrap(Wrap { trim: false }).block(Block::new().padding(Padding::horizontal(1)));
+        let total = para.line_count(body.width.saturating_sub(2)) as u16;
+        // Keep the cursor (end of body) in view while typing.
+        let scroll = if form.focus == 4 { total.saturating_sub(body.height) } else { 0 };
+        f.render_widget(para.scroll((scroll, 0)), body);
+    }
+
     // ---------- editor ----------
 
-    fn run_editor(&mut self, job: EditorJob) -> Result<Option<Pending>> {
+    fn run_editor(&mut self, job: EditorJob) -> Result<Option<SendReq>> {
         let EditorJob::Compose { mut req, template } = job;
         if let Some(t) = &template {
             req.template = Some(t.name.clone());
         }
-        // Resolve recipients/subject/template up front so the editor shows the real thing.
-        let (to, cc, subject, body) = if req.reply_to_thread.is_some() || req.template.is_some() {
-            let mut probe = req.clone();
-            if probe.body.is_empty() && probe.template.is_none() {
-                probe.body = " ".into();
-            }
-            if probe.to.is_empty() && probe.reply_to_thread.is_none() {
-                probe.to = "recipient@example.com".into();
-            }
-            let c = self.e.compose(&probe)?;
-            let to = if req.to.is_empty() && req.reply_to_thread.is_none() { String::new() } else { c.to };
-            (to, c.cc, c.subject, c.body.trim().to_string())
-        } else {
-            (req.to.clone(), req.cc.clone(), req.subject.clone(), req.body.clone())
-        };
+        let (to, cc, subject, body) = self.prefill(&req)?;
 
         let draft = format!(
             "To: {to}\nCc: {cc}\nBcc: \nSubject: {subject}\n# ── write below; lines starting with # are ignored ──\n{}\n",
@@ -560,14 +711,7 @@ impl App {
         if out.body.is_empty() {
             return Ok(None);
         }
-        let preview = format!(
-            "To: {}\n{}Subject: {}\n\n{}",
-            out.to,
-            if out.cc.is_empty() { String::new() } else { format!("Cc: {}\n", out.cc) },
-            out.subject,
-            out.body
-        );
-        Ok(Some(Pending { req: out, preview }))
+        Ok(Some(out))
     }
 
     // ---------- drawing ----------
@@ -603,7 +747,7 @@ impl App {
                 });
             }
         }
-        let right = format!("{}{} ", if self.loading { "⟳ " } else { "" }, self.me);
+        let right = format!("{}[c] ✎ Compose   {} ", if self.loading { "⟳ " } else { "" }, self.me);
         let [l, r] = Layout::horizontal([Constraint::Fill(1), Constraint::Length(right.chars().count() as u16)]).areas(area);
         f.render_widget(
             Paragraph::new(Line::from(spans)).block(Block::new().borders(Borders::BOTTOM).border_style(Style::new().fg(Color::Rgb(60, 60, 66)))),
@@ -705,7 +849,7 @@ impl App {
 
     fn draw_bottom(&self, f: &mut Frame, area: Rect) {
         let help = match self.view {
-            View::List => "↵ open · r reply · T template · c compose · e archive · s star · u read · l label · / search · g refresh · ? help · q quit",
+            View::List => "c compose · ↵ open · r reply · T template · e archive · s star · u read · l label · / search · g refresh · ? help · q quit",
             View::Reader { .. } => "esc back · j/k scroll · r reply · T template · f forward · e archive · s star · l label · p full/clean · ? help",
         };
         let text = if self.status.is_empty() {
@@ -722,14 +866,15 @@ impl App {
         let area = f.area();
         match &self.overlay {
             Overlay::None => {}
+            Overlay::Compose(form) => self.draw_compose(f, form),
             Overlay::Help => {
                 let keys = [
                     ("Tab / 1-5", "switch tab (To do · Primary · Starred · Newsletters · All)"),
                     ("j k ↑ ↓", "move / scroll"),
                     ("↵  o", "open thread"),
                     ("esc", "back / clear search"),
-                    ("c", "compose new mail in $EDITOR"),
-                    ("r", "reply in $EDITOR"),
+                    ("c", "compose new mail (Ctrl+S send · Ctrl+D draft · Ctrl+E $EDITOR)"),
+                    ("r", "reply"),
                     ("T", "reply from a template"),
                     ("f", "forward (in reader)"),
                     ("e", "archive"),
@@ -773,29 +918,13 @@ impl App {
                 f.render_widget(Clear, r);
                 f.render_widget(Paragraph::new(lines).block(popup(" Reply with template — ↵ choose, esc cancel ")), r);
             }
-            Overlay::Confirm(p) => {
-                let mut lines: Vec<Line> = p.preview.lines().take(18).map(|l| Line::raw(l.to_string())).collect();
-                lines.push(Line::raw(""));
-                lines.push(Line::from(vec![
-                    Span::styled(" y ", Style::new().fg(Color::Black).bg(CRAYON).bold()),
-                    Span::raw(" send   "),
-                    Span::styled(" d ", Style::new().fg(Color::Black).bg(Color::Gray).bold()),
-                    Span::raw(" save draft   "),
-                    Span::styled(" e ", Style::new().fg(Color::Black).bg(Color::Gray).bold()),
-                    Span::raw(" edit again   "),
-                    Span::styled(" n ", Style::new().fg(Color::Black).bg(Color::Gray).bold()),
-                    Span::raw(" discard"),
-                ]));
-                let r = centered(area, 80, lines.len() as u16 + 2);
-                f.render_widget(Clear, r);
-                f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(popup(" Ready to send ")), r);
-            }
         }
     }
 }
 
 fn popup(title: &str) -> Block<'_> {
     Block::bordered()
+        .style(Style::new().bg(Color::Rgb(24, 25, 32)))
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(CRAYON))
         .title(Span::styled(title, Style::new().bold()))

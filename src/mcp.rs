@@ -6,7 +6,7 @@ use crate::engine::{Actor, Engine, SendReq};
 use crate::models::{Contact, Routine, Template};
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 
 const INSTRUCTIONS: &str = "Crayon Box gives you the user's Gmail plus a local store of contact profiles, \
 reply templates and routines. Start with `inbox_triage` for an overview, read threads with `get_thread` \
@@ -217,6 +217,41 @@ fn call(e: &Engine, actor: &Actor, name: &str, a: &Value) -> Result<Value> {
     })
 }
 
+/// Handle one JSON-RPC message. Returns `None` for notifications.
+pub fn handle(engine: &Engine, actor: &mut Actor, msg: &Value, rename: bool) -> Option<Value> {
+    let id = msg.get("id").cloned()?;
+    let method = msg["method"].as_str().unwrap_or_default();
+    let params = &msg["params"];
+    let result: std::result::Result<Value, (i64, String)> = match method {
+        "initialize" => {
+            if let (true, Some(n)) = (rename, params["clientInfo"]["name"].as_str()) {
+                *actor = Actor::Agent(n.to_string());
+            }
+            Ok(json!({
+                "protocolVersion": params["protocolVersion"].as_str().unwrap_or("2025-06-18"),
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "crayon-box", "version": env!("CARGO_PKG_VERSION")},
+                "instructions": INSTRUCTIONS,
+            }))
+        }
+        "ping" => Ok(json!({})),
+        "tools/list" => Ok(json!({"tools": tools()})),
+        "tools/call" => {
+            let name = params["name"].as_str().unwrap_or_default();
+            let args = if params["arguments"].is_object() { params["arguments"].clone() } else { json!({}) };
+            Ok(match call(engine, actor, name, &args) {
+                Ok(v) => json!({"content": [{"type": "text", "text": serde_json::to_string_pretty(&v).unwrap_or_default()}]}),
+                Err(e) => json!({"content": [{"type": "text", "text": format!("Error: {e:#}")}], "isError": true}),
+            })
+        }
+        _ => Err((-32601, format!("method not found: {method}"))),
+    };
+    Some(match result {
+        Ok(r) => json!({"jsonrpc": "2.0", "id": id, "result": r}),
+        Err((code, m)) => json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": m}}),
+    })
+}
+
 pub fn serve(engine: &Engine) -> Result<()> {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -227,49 +262,89 @@ pub fn serve(engine: &Engine) -> Result<()> {
         if line.trim().is_empty() {
             continue;
         }
-        let msg: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(e) => {
-                writeln!(stdout, "{}", json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": e.to_string()}}))?;
-                stdout.flush()?;
-                continue;
-            }
+        let resp = match serde_json::from_str::<Value>(&line) {
+            Ok(msg) => handle(engine, &mut actor, &msg, true),
+            Err(e) => Some(json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": e.to_string()}})),
         };
-        let Some(id) = msg.get("id").cloned() else {
-            continue; // notification
-        };
-        let method = msg["method"].as_str().unwrap_or_default();
-        let params = &msg["params"];
-        let result: std::result::Result<Value, (i64, String)> = match method {
-            "initialize" => {
-                if let Some(n) = params["clientInfo"]["name"].as_str() {
-                    actor = Actor::Agent(n.to_string());
-                }
-                Ok(json!({
-                    "protocolVersion": params["protocolVersion"].as_str().unwrap_or("2025-06-18"),
-                    "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "crayon-box", "version": env!("CARGO_PKG_VERSION")},
-                    "instructions": INSTRUCTIONS,
-                }))
-            }
-            "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({"tools": tools()})),
-            "tools/call" => {
-                let name = params["name"].as_str().unwrap_or_default();
-                let args = if params["arguments"].is_object() { params["arguments"].clone() } else { json!({}) };
-                Ok(match call(engine, &actor, name, &args) {
-                    Ok(v) => json!({"content": [{"type": "text", "text": serde_json::to_string_pretty(&v)?}]}),
-                    Err(e) => json!({"content": [{"type": "text", "text": format!("Error: {e:#}")}], "isError": true}),
-                })
-            }
-            _ => Err((-32601, format!("method not found: {method}"))),
-        };
-        let resp = match result {
-            Ok(r) => json!({"jsonrpc": "2.0", "id": id, "result": r}),
-            Err((code, m)) => json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": m}}),
-        };
-        writeln!(stdout, "{resp}")?;
-        stdout.flush()?;
+        if let Some(resp) = resp {
+            writeln!(stdout, "{resp}")?;
+            stdout.flush()?;
+        }
     }
     Ok(())
+}
+
+fn same(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Streamable-HTTP MCP for hosted agents (POST JSON-RPC, JSON responses, no SSE).
+/// Auth: `Authorization: Bearer <token>`, or the token as the last path segment
+/// (`/mcp/<token>`) for clients that only take a URL.
+pub fn serve_http(engine: &Engine, bind: &str, token: &str, agent: &str) -> Result<()> {
+    use tiny_http::{Header, Response, Server};
+    let server = Server::http(bind).map_err(|e| anyhow!("binding {bind}: {e}"))?;
+    eprintln!("Crayon MCP (HTTP) listening on http://{bind}/mcp as agent '{agent}'");
+    let json_ct: Header = "Content-Type: application/json".parse().unwrap();
+
+    for mut req in server.incoming_requests() {
+        let url = req.url().split('?').next().unwrap_or("/").trim_end_matches('/').to_string();
+        if url == "/health" {
+            let _ = req.respond(Response::from_string("ok"));
+            continue;
+        }
+        let path_token = url.strip_prefix("/mcp/").unwrap_or("");
+        if url != "/mcp" && path_token.is_empty() {
+            let _ = req.respond(Response::from_string("not found").with_status_code(404));
+            continue;
+        }
+        let bearer = req
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("Authorization"))
+            .and_then(|h| h.value.as_str().strip_prefix("Bearer ").map(str::to_string))
+            .unwrap_or_default();
+        if !(same(&bearer, token) || same(path_token, token)) {
+            engine.store.audit(&format!("agent:{agent}"), "http_auth", "rejected request with bad token", false);
+            let _ = req.respond(Response::from_string("unauthorized").with_status_code(401));
+            continue;
+        }
+        if req.method() != &tiny_http::Method::Post {
+            // No server-initiated stream; DELETE/GET are allowed to 405 per the spec.
+            let _ = req.respond(Response::from_string("").with_status_code(405));
+            continue;
+        }
+        let mut body = String::new();
+        if req.as_reader().take(4 << 20).read_to_string(&mut body).is_err() {
+            let _ = req.respond(Response::from_string("bad body").with_status_code(400));
+            continue;
+        }
+        let mut actor = Actor::Agent(agent.to_string());
+        let reply = match serde_json::from_str::<Value>(&body) {
+            Ok(Value::Array(batch)) => {
+                let out: Vec<Value> = batch.iter().filter_map(|m| handle(engine, &mut actor, m, false)).collect();
+                (!out.is_empty()).then(|| Value::Array(out))
+            }
+            Ok(msg) => handle(engine, &mut actor, &msg, false),
+            Err(e) => Some(json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": e.to_string()}})),
+        };
+        let _ = match reply {
+            Some(v) => {
+                let mut resp = Response::from_string(v.to_string()).with_header(json_ct.clone());
+                if body.contains("\"initialize\"") {
+                    let sid = format!("Mcp-Session-Id: {}", rand_hex(16));
+                    resp = resp.with_header(sid.parse::<Header>().unwrap());
+                }
+                req.respond(resp)
+            }
+            None => req.respond(Response::empty(202)),
+        };
+    }
+    Ok(())
+}
+
+pub fn rand_hex(n: usize) -> String {
+    use rand::Rng;
+    let mut r = rand::thread_rng();
+    (0..n).map(|_| format!("{:02x}", r.gen::<u8>())).collect()
 }

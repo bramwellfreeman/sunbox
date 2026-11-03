@@ -91,8 +91,23 @@ enum Cmd {
     /// What AI agents may do, and what they did.
     #[command(subcommand)]
     Agent(AgentCmd),
-    /// Run the MCP server on stdio (for Claude Code, Codex, opencode…).
-    Mcp,
+    /// Run the MCP server: stdio (Claude Code, Codex, opencode…) or --http for hosted agents.
+    Mcp {
+        /// Serve streamable HTTP instead of stdio.
+        #[arg(long)]
+        http: bool,
+        #[arg(long, default_value = "127.0.0.1:8787")]
+        bind: String,
+        /// Agent name used in the audit log.
+        #[arg(long, default_value = "remote")]
+        name: String,
+        /// Print the access token (creating one if needed) and exit.
+        #[arg(long)]
+        show_token: bool,
+        /// Replace the access token (old one stops working) and exit.
+        #[arg(long)]
+        rotate_token: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -296,7 +311,20 @@ fn run(cli: Cli) -> Result<()> {
 
     match cmd {
         Cmd::Tui => tui::run(e)?,
-        Cmd::Mcp => mcp::serve(&e)?,
+        Cmd::Mcp { http: false, show_token: false, rotate_token: false, .. } => mcp::serve(&e)?,
+        Cmd::Mcp { bind, name, show_token, rotate_token, .. } => {
+            let mut cfg = e.cfg.clone();
+            if cfg.mcp.http_token.is_empty() || rotate_token {
+                cfg.mcp.http_token = format!("crayon_{}", mcp::rand_hex(24));
+                cfg.save()?;
+                e.store.audit("user", "mcp_token", if rotate_token { "rotated" } else { "created" }, true);
+            }
+            if show_token || rotate_token {
+                println!("{}", cfg.mcp.http_token);
+            } else {
+                mcp::serve_http(&e, &bind, &cfg.mcp.http_token, &name)?;
+            }
+        }
         Cmd::Auth(a) => match a {
             AuthCmd::Setup { .. } => unreachable!(),
             AuthCmd::Login { no_browser } => {

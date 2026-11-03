@@ -89,7 +89,11 @@ impl Gmail {
             .into_iter()
             .collect();
         let (from_name, from_email) = split_address(&header(&last, "From"));
-        let is_bulk = is_bulk(&last, &from_email);
+        // Gmail's own tabs are the strongest signal: anything outside Primary is bulk.
+        let categorized = labels.iter().any(|l| {
+            matches!(l.as_str(), "CATEGORY_PROMOTIONS" | "CATEGORY_UPDATES" | "CATEGORY_SOCIAL" | "CATEGORY_FORUMS")
+        });
+        let is_bulk = categorized || is_bulk(&last, &from_email);
         Ok(ThreadSummary {
             id: id.to_string(),
             subject: header(&first, "Subject"),

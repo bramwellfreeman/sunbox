@@ -28,6 +28,15 @@ pub struct Config {
     pub google: Google,
     #[serde(default)]
     pub agent: Agent,
+    #[serde(default)]
+    pub mcp: Mcp,
+}
+
+/// Remote (HTTP) MCP access for hosted agents.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Mcp {
+    #[serde(default)]
+    pub http_token: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,7 +84,7 @@ impl Config {
             let raw = std::fs::read_to_string(&path)?;
             toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?
         } else {
-            Config { google: Google::default(), agent: Agent::default() }
+            Config { google: Google::default(), agent: Agent::default(), mcp: Mcp::default() }
         };
         if let Ok(id) = std::env::var("CRAYON_GOOGLE_CLIENT_ID") {
             cfg.google.client_id = id;
