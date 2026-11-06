@@ -18,6 +18,9 @@ pub struct ThreadSummary {
     /// Newsletters / notifications (List-Id, List-Unsubscribe, no-reply…).
     pub is_bulk: bool,
     pub labels: Vec<String>,
+    /// Which signed-in account it lives in.
+    #[serde(default)]
+    pub account: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +57,8 @@ pub struct ThreadDetail {
     /// Whole conversation flattened as `sender · date\nclean body` blocks —
     /// the cheapest way to hand a thread to an LLM.
     pub transcript: String,
+    #[serde(default)]
+    pub account: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

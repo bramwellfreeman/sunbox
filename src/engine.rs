@@ -143,6 +143,15 @@ impl Engine {
         self.store.accounts()
     }
 
+    /// Small UI preferences kept next to the data (e.g. which inboxes the TUI shows).
+    pub fn setting(&self, key: &str) -> Result<Option<String>> {
+        self.store.setting(key)
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.store.set_setting(key, value)
+    }
+
     pub fn default_account(&self) -> Result<Option<String>> {
         self.store.default_account()
     }
@@ -198,12 +207,20 @@ impl Engine {
     pub fn search(&self, actor: &Actor, query: &str, max: usize) -> Result<Vec<ThreadSummary>> {
         self.act(actor, "read", "search", query, || {
             let me = self.account()?;
-            self.gmail()?.list_threads(query, max, &me)
+            let mut ts = self.gmail()?.list_threads(query, max, &me)?;
+            for t in &mut ts {
+                t.account = me.clone();
+            }
+            Ok(ts)
         })
     }
 
     pub fn thread(&self, actor: &Actor, id: &str) -> Result<ThreadDetail> {
-        self.act(actor, "read", "read_thread", id, || self.gmail()?.thread(id))
+        self.act(actor, "read", "read_thread", id, || {
+            let mut t = self.gmail()?.thread(id)?;
+            t.account = self.account()?;
+            Ok(t)
+        })
     }
 
     pub fn labels(&self, actor: &Actor) -> Result<Vec<Label>> {

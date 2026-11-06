@@ -126,11 +126,11 @@ impl Store {
 
     // ---- settings ----
 
-    fn setting(&self, key: &str) -> Result<Option<String>> {
+    pub fn setting(&self, key: &str) -> Result<Option<String>> {
         Ok(self.db().query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| r.get(0)).optional()?)
     }
 
-    fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
         self.db().execute(
             "INSERT INTO settings VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![key, value],

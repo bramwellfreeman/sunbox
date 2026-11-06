@@ -25,10 +25,15 @@ const TABS: [&str; 5] = ["To do", "Primary", "Starred", "Newsletters", "All"];
 const SPLIT_MIN_WIDTH: u16 = 120;
 /// How long the selection has to rest before the preview is fetched.
 const PREVIEW_DELAY: Duration = Duration::from_millis(150);
+/// Setting that remembers which inboxes were shown.
+const SHOWN_KEY: &str = "tui_shown_accounts";
+
+/// One result per shown account.
+type PerAccount = Vec<(String, Result<Vec<ThreadSummary>>)>;
 
 enum Msg {
-    Inbox(Result<Vec<ThreadSummary>>),
-    Searched(String, Result<Vec<ThreadSummary>>),
+    Inbox(PerAccount),
+    Searched(String, PerAccount),
     Thread(Result<ThreadDetail>),
     /// Background fetch for the preview pane.
     Preview(String, Result<ThreadDetail>),
@@ -56,6 +61,8 @@ struct ComposeForm {
     fields: [String; 5],
     focus: usize,
     reply_to: Option<String>,
+    /// The account it goes out from.
+    from: String,
     armed_discard: bool,
 }
 
@@ -65,13 +72,15 @@ enum Overlay {
     None,
     Compose(ComposeForm),
     Help,
-    Templates { items: Vec<Template>, sel: usize, reply_to: Option<String> },
+    Templates { items: Vec<Template>, sel: usize, reply_to: Option<String>, from: String },
     Input { kind: InputKind, buf: String },
     Accounts(AccountsList),
 }
 
 struct AccountsList {
     items: Vec<String>,
+    /// Which inboxes are ticked (shown together).
+    ticked: Vec<bool>,
     sel: usize,
     default: Option<String>,
     /// First `x` arms, second signs out.
@@ -80,12 +89,17 @@ struct AccountsList {
 
 /// What needs the real terminal (editor) — handled by the main loop.
 enum EditorJob {
-    Compose { req: SendReq, template: Option<Template> },
+    Compose { req: SendReq, template: Option<Template>, from: String },
 }
 
 struct App {
+    /// The primary shown account: new mail goes out from here.
     e: Arc<Engine>,
     me: String,
+    /// One engine per signed-in account.
+    engines: HashMap<String, Arc<Engine>>,
+    /// Accounts whose inboxes are merged into the list, primary first.
+    shown: Vec<String>,
     tx: Sender<(u64, Msg)>,
     /// Bumped on account switch so replies for the old account are dropped.
     epoch: u64,
@@ -135,6 +149,8 @@ pub fn run(engine: Engine) -> Result<()> {
     let mut app = App {
         e,
         me,
+        engines: HashMap::new(),
+        shown: vec![],
         tx,
         epoch: 0,
         signing_in: false,
@@ -154,7 +170,18 @@ pub fn run(engine: Engine) -> Result<()> {
         preview: Preview::default(),
         hits: Hits::default(),
     };
-    app.reload();
+    app.refresh_engines();
+    // Bring back the inboxes shown last time, unless an account was asked for explicitly.
+    let saved: Vec<String> = app
+        .e
+        .setting(SHOWN_KEY)
+        .ok()
+        .flatten()
+        .map(|v| v.split(',').filter(|a| app.engines.contains_key(*a)).map(String::from).collect())
+        .unwrap_or_default();
+    let explicit = std::env::var("SUNBOX_ACCOUNT").is_ok() || app.e.default_account().ok().flatten().as_deref() != Some(app.me.as_str());
+    let shown = if saved.is_empty() || explicit { vec![app.me.clone()] } else { saved };
+    app.set_shown(shown, false);
 
     let mut term = ratatui::init();
     let _ = std::io::stdout().execute(EnableMouseCapture);
@@ -192,6 +219,8 @@ fn main_loop(term: &mut ratatui::DefaultTerminal, app: &mut App, rx: &Receiver<(
             std::io::stdout().execute(DisableMouseCapture)?;
             disable_raw_mode()?;
             std::io::stdout().execute(LeaveAlternateScreen)?;
+            let EditorJob::Compose { from, .. } = &job;
+            let from = from.clone();
             let edited = app.run_editor(job);
             std::io::stdout().execute(EnterAlternateScreen)?;
             enable_raw_mode()?;
@@ -206,6 +235,7 @@ fn main_loop(term: &mut ratatui::DefaultTerminal, app: &mut App, rx: &Receiver<(
                         fields: [r.to, r.cc, r.bcc, r.subject, r.body],
                         focus: 4,
                         reply_to: r.reply_to_thread,
+                        from,
                         armed_discard: false,
                     });
                 }
@@ -219,7 +249,11 @@ fn main_loop(term: &mut ratatui::DefaultTerminal, app: &mut App, rx: &Receiver<(
 
 impl App {
     fn spawn(&self, f: impl FnOnce(&Engine) -> Msg + Send + 'static) {
-        let e = self.e.clone();
+        self.spawn_on(self.e.clone(), f);
+    }
+
+    /// Run `f` in the background as a particular account.
+    fn spawn_on(&self, e: Arc<Engine>, f: impl FnOnce(&Engine) -> Msg + Send + 'static) {
         let tx = self.tx.clone();
         let epoch = self.epoch;
         std::thread::spawn(move || {
@@ -227,47 +261,126 @@ impl App {
         });
     }
 
-    fn reload(&mut self) {
-        self.loading = true;
-        self.spawn(|e| Msg::Inbox(e.search(&Actor::User, "in:inbox", 60)));
+    /// The engine for a thread's account (the primary one if unknown).
+    fn eng(&self, account: &str) -> Arc<Engine> {
+        self.engines.get(account).cloned().unwrap_or_else(|| self.e.clone())
     }
 
-    fn do_action(&mut self, label: &'static str, id: String, f: impl FnOnce(&Engine, &str) -> Result<()> + Send + 'static) {
+    fn refresh_engines(&mut self) {
+        let accounts = self.e.accounts().unwrap_or_default();
+        self.engines.retain(|a, _| accounts.contains(a));
+        for a in accounts {
+            if !self.engines.contains_key(&a) {
+                if let Ok(e) = self.e.for_account(&a) {
+                    self.engines.insert(a, Arc::new(e));
+                }
+            }
+        }
+    }
+
+    /// Fetch `query` from every shown inbox at once.
+    fn spawn_search(&self, query: String, max: usize, done: impl FnOnce(PerAccount) -> Msg + Send + 'static) {
+        let engines: Vec<(String, Arc<Engine>)> = self.shown.iter().map(|a| (a.clone(), self.eng(a))).collect();
+        self.spawn(move |_| {
+            let per = std::thread::scope(|sc| {
+                let handles: Vec<_> = engines
+                    .iter()
+                    .map(|(a, e)| {
+                        let q = &query;
+                        (a.clone(), sc.spawn(move || e.search(&Actor::User, q, max)))
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|(a, h)| (a, h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("fetch crashed")))))
+                    .collect()
+            });
+            done(per)
+        });
+    }
+
+    fn reload(&mut self) {
+        self.loading = true;
+        self.spawn_search("in:inbox".into(), 60, Msg::Inbox);
+    }
+
+    fn do_action(&mut self, label: &'static str, t: &ThreadSummary, f: impl FnOnce(&Engine, &str) -> Result<()> + Send + 'static) {
         self.status = format!("{label}…");
-        self.spawn(move |e| Msg::Done { status: f(e, &id).map(|_| label.to_string()), reload: true });
+        let id = t.id.clone();
+        self.spawn_on(self.eng(&t.account), move |e| Msg::Done { status: f(e, &id).map(|_| label.to_string()), reload: true });
+    }
+
+    /// Show these inboxes (merged), the first one primary.
+    fn set_shown(&mut self, mut shown: Vec<String>, announce: bool) {
+        shown.dedup();
+        if shown.is_empty() {
+            return;
+        }
+        self.refresh_engines();
+        shown.retain(|a| self.engines.contains_key(a));
+        let Some(primary) = shown.first().cloned() else { return };
+        self.e = self.eng(&primary);
+        self.me = primary;
+        let _ = self.e.set_setting(SHOWN_KEY, &shown.join(","));
+        if announce {
+            self.status = if shown.len() == 1 { format!("Showing {}", self.me) } else { format!("Showing {} inboxes", shown.len()) };
+        }
+        self.shown = shown;
+        self.epoch += 1;
+        self.inbox.clear();
+        self.search = None;
+        self.cache.clear();
+        self.fetching.clear();
+        self.preview = Preview::default();
+        self.view = View::List;
+        self.overlay = Overlay::None;
+        self.table.select(Some(0));
+        self.reload();
+    }
+
+    /// Merge per-account results, newest first; report the first failure.
+    fn merge(&mut self, per: PerAccount) -> Vec<ThreadSummary> {
+        let mut all = vec![];
+        let mut errs = vec![];
+        for (a, r) in per {
+            match r {
+                Ok(ts) => all.extend(ts),
+                Err(e) => errs.push(format!("{a}: {e:#}")),
+            }
+        }
+        if let Some(e) = errs.first() {
+            self.status = format!("Error: {e}");
+        }
+        all.sort_by(|a, b| b.date.cmp(&a.date));
+        all
     }
 
     fn on_msg(&mut self, m: Msg) {
         match m {
-            Msg::Inbox(r) => {
+            Msg::Inbox(per) => {
                 self.loading = false;
-                match r {
-                    Ok(ts) => {
-                        // Drop cached threads that went away or grew new messages.
-                        self.cache.retain(|id, t| ts.iter().any(|s| &s.id == id && s.message_count == t.messages.len()));
-                        self.inbox = ts;
-                        if self.search.is_none() && self.status.ends_with('…') {
-                            self.status.clear();
-                        }
-                        // Land on a non-empty tab the first time.
-                        if self.visible().is_empty() && self.tab == 0 && !self.inbox.is_empty() {
-                            self.tab = 1;
-                        }
-                        self.clamp();
-                    }
-                    Err(e) => self.status = format!("Error: {e:#}"),
+                if self.search.is_none() && self.status.ends_with('…') {
+                    self.status.clear();
                 }
+                let ts = self.merge(per);
+                // Drop cached threads that went away or grew new messages.
+                self.cache.retain(|id, t| ts.iter().any(|s| &s.id == id && s.message_count == t.messages.len()));
+                self.inbox = ts;
+                // Land on a non-empty tab the first time.
+                if self.visible().is_empty() && self.tab == 0 && !self.inbox.is_empty() {
+                    self.tab = 1;
+                }
+                self.clamp();
             }
-            Msg::Searched(q, r) => {
+            Msg::Searched(q, per) => {
                 self.loading = false;
-                match r {
-                    Ok(ts) => {
-                        self.status = format!("{} result(s) for “{q}” — Esc to clear", ts.len());
-                        self.search = Some((q, ts));
-                        self.table.select(Some(0));
-                    }
-                    Err(e) => self.status = format!("Error: {e:#}"),
+                self.status.clear();
+                let ts = self.merge(per);
+                if self.status.is_empty() {
+                    self.status = format!("{} result(s) for “{q}” — Esc to clear", ts.len());
                 }
+                self.search = Some((q, ts));
+                self.table.select(Some(0));
             }
             Msg::Thread(r) => {
                 self.loading = false;
@@ -290,7 +403,12 @@ impl App {
                 self.signing_in = false;
                 match r {
                     Ok(acct) => {
-                        self.switch_account(&acct);
+                        // A new account joins the inboxes already on screen.
+                        let mut shown = self.shown.clone();
+                        if !shown.contains(&acct) {
+                            shown.push(acct.clone());
+                        }
+                        self.set_shown(shown, false);
                         self.status = format!("✓ Signed in as {acct}");
                     }
                     Err(e) => self.status = format!("Error: {e:#}"),
@@ -342,7 +460,7 @@ impl App {
                 .or_else(|| Some(ThreadSummary {
                     id: t.id.clone(), subject: t.subject.clone(), from_name: String::new(), from_email: String::new(),
                     snippet: String::new(), date: 0, message_count: t.messages.len(), unread: false, starred: false,
-                    needs_reply: false, is_bulk: false, labels: vec![],
+                    needs_reply: false, is_bulk: false, labels: vec![], account: t.account.clone(),
                 }));
         }
         let v = self.visible();
@@ -383,24 +501,24 @@ impl App {
                 self.accounts_key(list, k);
                 return;
             }
-            Overlay::Templates { items, mut sel, reply_to } => {
+            Overlay::Templates { items, mut sel, reply_to, from } => {
                 match k.code {
                     KeyCode::Esc | KeyCode::Char('q') => {}
                     KeyCode::Down | KeyCode::Char('j') => {
                         sel = (sel + 1).min(items.len().saturating_sub(1));
-                        self.overlay = Overlay::Templates { items, sel, reply_to };
+                        self.overlay = Overlay::Templates { items, sel, reply_to, from };
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
                         sel = sel.saturating_sub(1);
-                        self.overlay = Overlay::Templates { items, sel, reply_to };
+                        self.overlay = Overlay::Templates { items, sel, reply_to, from };
                     }
                     KeyCode::Enter => {
                         if let Some(t) = items.get(sel).cloned() {
                             let req = SendReq { reply_to_thread: reply_to, ..Default::default() };
-                            self.open_compose(req, Some(t));
+                            self.open_compose(req, Some(t), from);
                         }
                     }
-                    _ => self.overlay = Overlay::Templates { items, sel, reply_to },
+                    _ => self.overlay = Overlay::Templates { items, sel, reply_to, from },
                 }
                 return;
             }
@@ -414,7 +532,7 @@ impl App {
                 return;
             }
             KeyCode::Char('c') => {
-                self.open_compose(SendReq::default(), None);
+                self.open_compose(SendReq::default(), None, self.me.clone());
                 return;
             }
             KeyCode::Char('/') => {
@@ -434,9 +552,10 @@ impl App {
         }
         if let Some(t) = &sel {
             let id = t.id.clone();
+            let acct = if t.account.is_empty() { self.me.clone() } else { t.account.clone() };
             match k.code {
                 KeyCode::Char('r') => {
-                    self.open_compose(SendReq { reply_to_thread: Some(id), ..Default::default() }, None);
+                    self.open_compose(SendReq { reply_to_thread: Some(id), ..Default::default() }, None, acct);
                     return;
                 }
                 KeyCode::Char('T') => {
@@ -444,7 +563,7 @@ impl App {
                         Ok(items) if items.is_empty() => {
                             self.status = "No templates yet — `sunbox templates set <name>` or ask an agent".into()
                         }
-                        Ok(items) => self.overlay = Overlay::Templates { items, sel: 0, reply_to: Some(id) },
+                        Ok(items) => self.overlay = Overlay::Templates { items, sel: 0, reply_to: Some(id), from: acct },
                         Err(e) => self.status = format!("Error: {e:#}"),
                     }
                     return;
@@ -456,7 +575,7 @@ impl App {
                             .map(|m| format!("\n\n---------- Forwarded message ---------\nFrom: {}\nDate: {}\nSubject: {}\nTo: {}\n\n{}", m.from, fmt_date(m.date, true), m.subject, m.to, m.body))
                             .unwrap_or_default();
                         let req = SendReq { subject: format!("Fwd: {}", detail.subject), body: quoted, ..Default::default() };
-                        self.open_compose(req, None);
+                        self.open_compose(req, None, acct);
                     } else {
                         self.status = "Open the thread first (Enter), then f to forward".into();
                     }
@@ -464,22 +583,22 @@ impl App {
                 }
                 KeyCode::Char('e') => {
                     self.leave_reader();
-                    self.do_action("Archived", id, |e, id| e.archive(&Actor::User, id));
+                    self.do_action("Archived", t, |e, id| e.archive(&Actor::User, id));
                     return;
                 }
                 KeyCode::Char('#') => {
                     self.leave_reader();
-                    self.do_action("Moved to trash", id, |e, id| e.trash(&Actor::User, id));
+                    self.do_action("Moved to trash", t, |e, id| e.trash(&Actor::User, id));
                     return;
                 }
                 KeyCode::Char('s') => {
                     let on = !t.starred;
-                    self.do_action(if on { "Starred" } else { "Unstarred" }, id, move |e, id| e.star(&Actor::User, id, on));
+                    self.do_action(if on { "Starred" } else { "Unstarred" }, t, move |e, id| e.star(&Actor::User, id, on));
                     return;
                 }
                 KeyCode::Char('u') => {
                     let read = t.unread;
-                    self.do_action(if read { "Marked read" } else { "Marked unread" }, id, move |e, id| e.mark_read(&Actor::User, id, read));
+                    self.do_action(if read { "Marked read" } else { "Marked unread" }, t, move |e, id| e.mark_read(&Actor::User, id, read));
                     return;
                 }
                 KeyCode::Char('l') => {
@@ -534,7 +653,8 @@ impl App {
         match (self.e.accounts(), self.e.default_account()) {
             (Ok(items), Ok(default)) => {
                 let sel = items.iter().position(|a| a == &self.me).unwrap_or(0);
-                self.overlay = Overlay::Accounts(AccountsList { items, sel, default, armed_remove: false });
+                let ticked = items.iter().map(|a| self.shown.contains(a)).collect();
+                self.overlay = Overlay::Accounts(AccountsList { items, ticked, sel, default, armed_remove: false });
             }
             (Err(e), _) | (_, Err(e)) => self.status = format!("Error: {e:#}"),
         }
@@ -549,11 +669,38 @@ impl App {
             KeyCode::Esc | KeyCode::Char('q') => return,
             KeyCode::Down | KeyCode::Char('j') => list.sel = (list.sel + 1).min(list.items.len().saturating_sub(1)),
             KeyCode::Up | KeyCode::Char('k') => list.sel = list.sel.saturating_sub(1),
+            // Space ticks inboxes to show together; Enter applies the ticks
+            // (or, with only the cursor's account ticked, shows just that one).
+            KeyCode::Char(' ') => {
+                if let Some(t) = list.ticked.get_mut(list.sel) {
+                    *t = !*t;
+                }
+            }
+            KeyCode::Char('A') => {
+                let all = list.ticked.iter().all(|t| *t);
+                list.ticked.iter_mut().for_each(|t| *t = !all);
+            }
             KeyCode::Enter => {
-                if let Some(a) = picked {
-                    if a != self.me {
-                        self.switch_account(&a);
+                let mut shown: Vec<String> =
+                    list.items.iter().zip(&list.ticked).filter(|(_, t)| **t).map(|(a, _)| a.clone()).collect();
+                if shown.is_empty() {
+                    shown = picked.into_iter().collect();
+                }
+                // The cursor's account goes first, so it's the one new mail comes from.
+                if let Some(p) = list.items.get(list.sel) {
+                    if let Some(i) = shown.iter().position(|a| a == p) {
+                        let p = shown.remove(i);
+                        shown.insert(0, p);
                     }
+                }
+                if shown != self.shown {
+                    self.set_shown(shown, true);
+                }
+                return;
+            }
+            KeyCode::Char('o') => {
+                if let Some(a) = picked {
+                    self.set_shown(vec![a], true);
                 }
                 return;
             }
@@ -586,17 +733,22 @@ impl App {
                 } else {
                     match self.e.logout(Some(&a)) {
                         Ok(gone) => {
-                            self.status = format!("✓ Signed out {gone}");
-                            if gone == self.me {
+                            self.refresh_engines();
+                            let mut shown: Vec<String> = self.shown.iter().filter(|a| **a != gone).cloned().collect();
+                            if shown.is_empty() {
                                 match self.e.default_account() {
-                                    Ok(Some(next)) => self.switch_account(&next),
+                                    Ok(Some(next)) => shown.push(next),
                                     _ => {
                                         self.status = "Signed out of every account — `sunbox auth login` to come back".into();
                                         self.quit = true;
+                                        return;
                                     }
                                 }
-                                return;
                             }
+                            if shown != self.shown {
+                                self.set_shown(shown, false);
+                            }
+                            self.status = format!("✓ Signed out {gone}");
                             self.open_accounts();
                             return;
                         }
@@ -610,39 +762,17 @@ impl App {
         self.overlay = Overlay::Accounts(list);
     }
 
-    /// Point everything at another account and start over on its inbox.
-    fn switch_account(&mut self, account: &str) {
-        match self.e.for_account(account) {
-            Ok(e) => {
-                self.e = Arc::new(e);
-                self.me = account.to_string();
-                self.epoch += 1;
-                self.inbox.clear();
-                self.search = None;
-                self.cache.clear();
-                self.fetching.clear();
-                self.preview = Preview::default();
-                self.view = View::List;
-                self.overlay = Overlay::None;
-                self.table.select(Some(0));
-                self.status = format!("Switched to {account}");
-                self.reload();
-            }
-            Err(e) => self.status = format!("Error: {e:#}"),
-        }
-    }
-
     fn open_thread(&mut self, t: ThreadSummary) {
         let id = t.id.clone();
         if let Some(detail) = self.cache.get(&id) {
             self.view = View::Reader { t: detail.clone(), scroll: 0, full: false };
             if t.unread {
-                self.spawn(move |e| Msg::Done { status: e.mark_read(&Actor::User, &id, true).map(|_| String::new()), reload: false });
+                self.spawn_on(self.eng(&t.account), move |e| Msg::Done { status: e.mark_read(&Actor::User, &id, true).map(|_| String::new()), reload: false });
             }
         } else {
             self.loading = true;
             self.status = "Opening…".into();
-            self.spawn(move |e| {
+            self.spawn_on(self.eng(&t.account), move |e| {
                 let r = e.thread(&Actor::User, &id);
                 if r.is_ok() && t.unread {
                     let _ = e.mark_read(&Actor::User, &id, true);
@@ -662,16 +792,17 @@ impl App {
         if !self.hits.split || !matches!(self.view, View::List) {
             return;
         }
-        let id = self.selected().map(|t| t.id);
+        let sel = self.selected();
+        let id = sel.as_ref().map(|t| t.id.clone());
         if id != self.preview.id {
             self.preview = Preview { id, since: Some(Instant::now()), scroll: 0 };
             return;
         }
-        let Some(id) = id else { return };
+        let (Some(id), Some(t)) = (id, sel) else { return };
         let settled = self.preview.since.is_some_and(|t| t.elapsed() >= PREVIEW_DELAY);
         if settled && !self.cache.contains_key(&id) && !self.fetching.contains(&id) {
             self.fetching.insert(id.clone());
-            self.spawn(move |e| {
+            self.spawn_on(self.eng(&t.account), move |e| {
                 let r = e.thread(&Actor::User, &id);
                 Msg::Preview(id, r)
             });
@@ -762,16 +893,14 @@ impl App {
             InputKind::Search => {
                 self.loading = true;
                 self.status = format!("Searching “{buf}”…");
-                self.spawn(move |e| {
-                    let r = e.search(&Actor::User, &buf, 50);
-                    Msg::Searched(buf, r)
-                });
+                let q = buf.clone();
+                self.spawn_search(buf, 50, move |per| Msg::Searched(q, per));
             }
             InputKind::Label => {
                 if let Some(t) = self.selected() {
                     self.status = format!("Labelling {buf}…");
-                    let id = t.id;
-                    self.spawn(move |e| Msg::Done {
+                    let id = t.id.clone();
+                    self.spawn_on(self.eng(&t.account), move |e| Msg::Done {
                         status: e.label(&Actor::User, &id, &buf, false).map(|_| format!("Labelled {buf}")),
                         reload: true,
                     });
@@ -781,7 +910,7 @@ impl App {
     }
 
     /// Resolve recipients/subject/template so the composer shows the real message.
-    fn prefill(&self, req: &SendReq) -> Result<(String, String, String, String)> {
+    fn prefill(&self, req: &SendReq, from: &str) -> Result<(String, String, String, String)> {
         if req.reply_to_thread.is_none() && req.template.is_none() {
             return Ok((req.to.clone(), req.cc.clone(), req.subject.clone(), req.body.clone()));
         }
@@ -792,12 +921,12 @@ impl App {
         if probe.to.is_empty() && probe.reply_to_thread.is_none() {
             probe.to = "recipient@example.com".into();
         }
-        let c = self.e.compose(&probe)?;
+        let c = self.eng(from).compose(&probe)?;
         let to = if req.to.is_empty() && req.reply_to_thread.is_none() { String::new() } else { c.to };
         Ok((to, c.cc, c.subject, c.body.trim().to_string()))
     }
 
-    fn open_compose(&mut self, mut req: SendReq, template: Option<Template>) {
+    fn open_compose(&mut self, mut req: SendReq, template: Option<Template>, from: String) {
         if let Some(t) = &template {
             req.template = Some(t.name.clone());
         }
@@ -807,7 +936,7 @@ impl App {
             (None, None, true) => " Forward ".to_string(),
             _ => " New message ".to_string(),
         };
-        match self.prefill(&req) {
+        match self.prefill(&req, &from) {
             Ok((to, cc, subject, body)) => {
                 let focus = if to.is_empty() { 0 } else if subject.is_empty() { 3 } else { 4 };
                 self.overlay = Overlay::Compose(ComposeForm {
@@ -815,6 +944,7 @@ impl App {
                     fields: [to, cc, String::new(), subject, body],
                     focus,
                     reply_to: req.reply_to_thread,
+                    from,
                     armed_discard: false,
                 });
             }
@@ -845,15 +975,26 @@ impl App {
                 }
                 self.status = "Sending…".into();
                 let r = req(&form);
-                self.spawn(move |e| Msg::Done { status: e.send(&Actor::User, &r).map(|_| "Sent".into()), reload: true });
+                self.spawn_on(self.eng(&form.from), move |e| Msg::Done { status: e.send(&Actor::User, &r).map(|_| "Sent".into()), reload: true });
             }
             KeyCode::Char('d') if ctrl => {
                 self.status = "Saving draft…".into();
                 let r = req(&form);
-                self.spawn(move |e| Msg::Done { status: e.draft(&Actor::User, &r).map(|_| "Draft saved".into()), reload: false });
+                self.spawn_on(self.eng(&form.from), move |e| Msg::Done { status: e.draft(&Actor::User, &r).map(|_| "Draft saved".into()), reload: false });
             }
             KeyCode::Char('e') if ctrl => {
-                self.job = Some(EditorJob::Compose { req: req(&form), template: None });
+                self.job = Some(EditorJob::Compose { req: req(&form), template: None, from: form.from.clone() });
+            }
+            // Cycle the sending account (new mail only; replies stay in their thread's account).
+            KeyCode::Char('f') if ctrl => {
+                let mut accts: Vec<&String> = self.engines.keys().collect();
+                accts.sort();
+                if form.reply_to.is_some() {
+                    self.status = "Replies go out from the account the thread is in".into();
+                } else if let Some(i) = accts.iter().position(|a| **a == form.from) {
+                    form.from = accts[(i + 1) % accts.len()].clone();
+                }
+                self.overlay = Overlay::Compose(form);
             }
             KeyCode::Esc => {
                 let empty = form.fields[4].trim().is_empty();
@@ -910,10 +1051,16 @@ impl App {
         let h = area.height.saturating_sub(2);
         let r = Rect { x: area.x + (area.width - w) / 2, y: area.y + 1, width: w, height: h };
         f.render_widget(Clear, r);
-        let block = self.th.popup(&form.title).title_bottom(
-            Line::from(" Ctrl+S send · Ctrl+D save draft · Ctrl+E open in $EDITOR · Tab next field · Esc discard ")
-                .fg(self.th.muted),
-        );
+        let multi = self.engines.len() > 1;
+        let hint = if multi {
+            " Ctrl+S send · Ctrl+D draft · Ctrl+E $EDITOR · Ctrl+F from · Tab next field · Esc discard "
+        } else {
+            " Ctrl+S send · Ctrl+D save draft · Ctrl+E open in $EDITOR · Tab next field · Esc discard "
+        };
+        let mut block = self.th.popup(&form.title).title_bottom(Line::from(hint).fg(self.th.muted));
+        if multi {
+            block = block.title(Line::from(format!(" from {} ", form.from)).fg(self.th.accent).right_aligned());
+        }
         let inner = block.inner(r);
         f.render_widget(block, r);
         let [hdr, sep, body] =
@@ -954,11 +1101,11 @@ impl App {
     // ---------- editor ----------
 
     fn run_editor(&mut self, job: EditorJob) -> Result<Option<SendReq>> {
-        let EditorJob::Compose { mut req, template } = job;
+        let EditorJob::Compose { mut req, template, from } = job;
         if let Some(t) = &template {
             req.template = Some(t.name.clone());
         }
-        let (to, cc, subject, body) = self.prefill(&req)?;
+        let (to, cc, subject, body) = self.prefill(&req, &from)?;
 
         let draft = format!(
             "To: {to}\nCc: {cc}\nBcc: \nSubject: {subject}\n# ── write below; lines starting with # are ignored ──\n{}\n",
@@ -1047,7 +1194,12 @@ impl App {
             }
         }
         // The account name gives way to the tabs on narrow terminals (`a` still shows it).
-        let me = if area.width >= 120 { self.me.as_str() } else { "" };
+        let many = format!("{} inboxes", self.shown.len());
+        let me = match (area.width >= 120, self.shown.len() > 1) {
+            (false, _) => "",
+            (true, true) => many.as_str(),
+            (true, false) => self.me.as_str(),
+        };
         let right = Line::from(vec![
             Span::styled(if self.loading { "⟳ " } else { "" }, Style::new().fg(self.th.muted)),
             Span::styled(me, Style::new().fg(self.th.muted)),
@@ -1062,6 +1214,7 @@ impl App {
     fn draw_list(&mut self, f: &mut Frame, area: Rect) {
         self.hits.list = area;
         let split = self.hits.split;
+        let multi = self.shown.len() > 1;
         let th = &self.th;
         let rows: Vec<Row> = self
             .visible()
@@ -1089,6 +1242,8 @@ impl App {
                 }
                 subj.push(Span::styled(t.subject.clone(), subj_style));
                 let date = Span::styled(fmt_date(t.date, false), Style::new().fg(if t.unread { th.accent } else { th.muted }));
+                // With several inboxes merged, tag each row with the account it's in.
+                let tag = multi.then(|| Span::styled(account_tag(&t.account, &self.shown), Style::new().fg(th.avatar(&t.account))));
                 if split {
                     // Two-line card: sender + date, then subject, then a muted snippet.
                     Row::new(vec![
@@ -1098,12 +1253,18 @@ impl App {
                             Line::from(subj),
                             Line::from(Span::styled(t.snippet.clone(), Style::new().fg(th.muted))),
                         ])),
-                        Cell::from(Line::from(date).alignment(Alignment::Right)),
+                        Cell::from(Text::from(vec![
+                            Line::from(date).alignment(Alignment::Right),
+                            Line::from(tag.unwrap_or_default()).alignment(Alignment::Right),
+                        ])),
                     ])
                     .height(3)
                     .bottom_margin(1)
                 } else {
                     subj.push(Span::styled(format!(" — {}", t.snippet), Style::new().fg(th.muted)));
+                    if let Some(tag) = tag {
+                        from.insert(0, Span::styled("● ", tag.style));
+                    }
                     Row::new(vec![
                         Cell::from(Line::from(vec![bar, Span::raw(" "), avatar])),
                         Cell::from(Line::from(from)),
@@ -1120,7 +1281,7 @@ impl App {
             return;
         }
         let widths: &[Constraint] = if split {
-            &[Constraint::Length(5), Constraint::Fill(1), Constraint::Length(8)]
+            &[Constraint::Length(5), Constraint::Fill(1), Constraint::Length(if multi { 11 } else { 8 })]
         } else {
             &[Constraint::Length(5), Constraint::Length(24), Constraint::Fill(1), Constraint::Length(8)]
         };
@@ -1135,6 +1296,9 @@ impl App {
         let th = &self.th;
         let mut lines: Vec<Line> = vec![Line::from(Span::styled(t.subject.clone(), Style::new().bold().fg(th.bright)))];
         let mut meta = format!("{} message{}", t.messages.len(), if t.messages.len() == 1 { "" } else { "s" });
+        if self.engines.len() > 1 && !t.account.is_empty() {
+            meta.push_str(&format!(" · in {}", t.account));
+        }
         if hint {
             meta.push_str(if full { " · full view (p: clean)" } else { " · clean view (p: full)" });
         }
@@ -1283,7 +1447,8 @@ impl App {
                     .enumerate()
                     .map(|(i, a)| {
                         let style = if i == list.sel { Style::new().fg(self.th.on_chip).bg(self.th.sun) } else { Style::new().fg(self.th.fg) };
-                        let current = if *a == self.me { Span::styled(" ● ", Style::new().fg(self.th.accent)) } else { Span::raw("   ") };
+                        let tick = if list.ticked.get(i).copied().unwrap_or(false) { "[✓]" } else { "[ ]" };
+                        let current = Span::styled(format!(" {tick}"), Style::new().fg(if *a == self.me { self.th.accent } else { self.th.muted }));
                         let default = if list.default.as_deref() == Some(a.as_str()) { Span::styled("  default", Style::new().fg(self.th.muted)) } else { Span::raw("") };
                         Line::from(vec![current, Span::styled(format!(" {:<40} ", a), style), default])
                     })
@@ -1292,12 +1457,12 @@ impl App {
                 let hint = if self.signing_in {
                     "  waiting on your browser…".to_string()
                 } else {
-                    "  ↵ switch · n add account · d make default · x sign out".to_string()
+                    "  space tick · A all · ↵ show ticked · o only this · n add · d default · x sign out".to_string()
                 };
                 lines.push(Line::from(Span::styled(hint, Style::new().fg(self.th.muted))));
-                let r = centered(area, 64, lines.len() as u16 + 2);
+                let r = centered(area, 84, lines.len() as u16 + 2);
                 f.render_widget(Clear, r);
-                f.render_widget(Paragraph::new(lines).block(self.th.popup(" Accounts — ● current ")), r);
+                f.render_widget(Paragraph::new(lines).block(self.th.popup(" Inboxes — tick the ones to show together ")), r);
             }
             Overlay::Templates { items, sel, .. } => {
                 let lines: Vec<Line> = items
@@ -1317,6 +1482,21 @@ impl App {
     }
 }
 
+
+/// Short account label for list rows: the part before the @, plus a bit of the
+/// domain when another shown account has the same name (bram@b… vs bram@e…).
+fn account_tag(account: &str, shown: &[String]) -> String {
+    let local = |a: &str| a.split('@').next().unwrap_or(a).to_string();
+    let mine = local(account);
+    let clash = shown.iter().any(|o| o != account && local(o) == mine);
+    let tag = if clash {
+        let dom: String = account.split('@').nth(1).unwrap_or("").chars().take(3).collect();
+        format!("{}@{dom}", mine.chars().take(6).collect::<String>())
+    } else {
+        mine
+    };
+    tag.chars().take(10).collect()
+}
 
 fn centered(area: Rect, w: u16, h: u16) -> Rect {
     let w = w.min(area.width.saturating_sub(2));

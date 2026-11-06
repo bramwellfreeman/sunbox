@@ -107,6 +107,7 @@ impl Gmail {
             from_name,
             from_email,
             labels,
+            account: String::new(),
         })
     }
 
@@ -127,7 +128,7 @@ impl Gmail {
             })
             .collect::<Vec<_>>()
             .join("\n\n---\n\n");
-        Ok(ThreadDetail { id: id.to_string(), subject, messages, transcript })
+        Ok(ThreadDetail { id: id.to_string(), subject, messages, transcript, account: String::new() })
     }
 
     pub fn send(&self, raw: &str, thread_id: Option<&str>) -> Result<String> {
