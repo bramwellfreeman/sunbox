@@ -485,6 +485,7 @@ impl App {
             from: if d.account.is_empty() { self.me.clone() } else { d.account },
             ai_thread: Some(d.thread_id),
             armed_discard: false,
+            ..Default::default()
         });
         self.status = "Ctrl+S sends · Ctrl+D saves it as a Gmail draft · edit anything first".into();
     }

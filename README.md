@@ -16,10 +16,11 @@ sunbox                   # inbox
 
 ## Use it
 
-- **TUI**: `sunbox`. Tabs To do · Primary · Starred · Newsletters · All. `↵` opens a thread, `r` replies,
+- **TUI**: `sunbox`. Tabs To do · Primary · Starred · Newsletters · All · Sent (who you wrote to, and who hasn't replied yet) · ✦ Claude. `↵` opens a thread, `r` replies,
   `T` replies from a template, `c` composes, `f` forwards, `e` archives, `s` stars, `l` labels,
-  `/` searches, `?` shows help. You write in `$EDITOR`, then choose send / draft / edit again / discard.
-- **CLI**: `sunbox inbox`, `search`, `read`, `send`, `archive`, `contacts …`, `templates …`, `routines …`.
+  `/` searches, `C` finds a contact, `?` shows help. In To/Cc/Bcc, start typing a name or address
+  and pick a suggestion with ↑↓ + Tab/↵. You write in `$EDITOR`, then choose send / draft / edit again / discard.
+- **CLI**: `sunbox inbox`, `search`, `read`, `send`, `archive`, `contacts find <name>`, `contacts …`, `templates …`, `routines …`.
   Add `--json` for machine output.
 - **Agents**: `sunbox agent install claude` registers the MCP server. See [AGENTS.md](AGENTS.md).
 - **Routines**: `sunbox routines install-timer` adds a systemd user timer that runs due routines.
@@ -29,7 +30,7 @@ sunbox                   # inbox
 - **Several inboxes at once**: in the TUI press `a`, tick inboxes with space (`A` ticks all) and press ↵.
   They merge into one list, newest first, with each row tagged by account. Replies and actions go
   through the right account, and Ctrl+F in the composer picks the sender for new mail.
-- **✦ Claude** (tab 6): Claude reads the inbox, picks categories that fit it (Clients, Bills, School…),
+- **✦ Claude** (tab 7): Claude reads the inbox, picks categories that fit it (Clients, Bills, School…),
   sorts every email under one with a priority and a one-line reason, and drafts a reply to each email
   that needs one. Emails that need something else get one-press buttons Claude labels itself:
   add to Google Calendar (opens prefilled for you to save), add a TickTick task (by email: set

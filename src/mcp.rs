@@ -84,6 +84,8 @@ fn tools() -> Value {
         t("label_thread", "Add (or remove) a user label by name; created if missing.",
           obj(json!({"thread_id": {"type": "string"}, "label": {"type": "string"}, "remove": {"type": "boolean"}}), &["thread_id", "label"])),
         t("list_labels", "User-created Gmail labels.", obj(json!({}), &[])),
+        t("find_people", "Look up who to write to: searches saved profiles plus everyone seen in the user's mail (name, address or company; every word must match). Best match first. Use it to fill to/cc before composing.",
+          obj(json!({"query": {"type": "string"}, "limit": {"type": "integer", "default": 10}}), &["query"])),
         t("list_contacts", "Contact profiles, optionally filtered by a text query.", obj(json!({"query": {"type": "string"}}), &[])),
         t("get_contact", "One contact profile by email.", obj(json!({"email": {"type": "string"}}), &["email"])),
         t("upsert_contact", "Create or update a contact profile. Only provided fields change; tags and fields merge.", obj(contact_props, &["email"])),
@@ -181,6 +183,10 @@ fn call(e: &Engine, actor: &Actor, name: &str, a: &Value) -> Result<Value> {
             json!({"ok": true})
         }
         "list_labels" => json!(e.labels(actor)?),
+        "find_people" => {
+            e.ensure_people(actor)?;
+            json!(e.find_people(actor, req_str(a, "query")?, a["limit"].as_u64().unwrap_or(10) as usize)?)
+        }
         "list_contacts" => json!(e.contacts(actor, a["query"].as_str())?),
         "get_contact" => json!(e.contact(actor, req_str(a, "email")?)?),
         "upsert_contact" => json!(e.upsert_contact(actor, serde_json::from_value::<Contact>(a.clone())?)?),
