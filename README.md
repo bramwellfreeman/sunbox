@@ -50,6 +50,10 @@ sunbox                   # inbox
   by phone, in person or elsewhere. Add a short note and it's archived (labelled `Sunbox/Handled`),
   the note goes on the sender's profile, and later briefings treat similar mail as important without
   suggesting a follow-up. `sunbox handled <id> --note …`; `sunbox handled` lists them.
+- **Ask Claude while writing** (Ctrl+K in the composer): say what the email should do ("tell her
+  Saturday works, ask about parking") or how to change it ("shorter and warmer"). Claude writes or
+  rewrites the body in place, using the thread, the recipients' profiles and your templates, and
+  fills an empty subject. Ctrl+Z puts your version back; things to double-check show under the text.
 - **Autocorrect** while you write: common typos are fixed the moment a word ends (teh → the,
   dont → don't, i → I), and a second after you pause Claude fixes spelling and capitals (never
   wording). Fixed words flash; Ctrl+Z undoes the last fix and won't redo it; Ctrl+G turns it off.

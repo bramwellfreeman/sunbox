@@ -49,6 +49,8 @@ enum Msg {
     AiReady(Vec<std::result::Result<bool, String>>),
     Inbox(PerAccount),
     Sent(PerAccount),
+    /// Claude wrote (or rewrote) the message in the composer.
+    Composed { gen: u64, r: Result<crate::assistant::ComposeHelp> },
     /// Claude's spelling fixes for the composer text it was given.
     Corrected { gen: u64, checked: String, fixes: Result<Vec<crate::assistant::Fix>> },
     Searched(String, PerAccount),
@@ -122,6 +124,12 @@ struct ComposeForm {
     sugg: Vec<Person>,
     sugg_sel: usize,
     ac: Autocorrect,
+    /// Ctrl+K: what to ask Claude to write (Some while the bar is open).
+    ask: Option<String>,
+    ask_busy: bool,
+    ask_gen: u64,
+    /// What Claude says to double-check in what it wrote.
+    check: Vec<String>,
 }
 
 /// Autocorrect state for one message being written.
@@ -486,6 +494,7 @@ impl App {
                 self.maybe_auto_brief();
             }
             Msg::Corrected { gen, checked, fixes } => self.on_corrected(gen, checked, fixes),
+            Msg::Composed { gen, r } => self.on_composed(gen, r),
             Msg::Sent(per) => {
                 self.sent_loading = false;
                 self.sent_loaded = true;
@@ -1257,6 +1266,27 @@ impl App {
         if k.code != KeyCode::Esc {
             form.armed_discard = false;
         }
+        if let Some(buf) = form.ask.as_mut() {
+            match k.code {
+                KeyCode::Esc => form.ask = None,
+                KeyCode::Enter => {
+                    let instruction = buf.trim().to_string();
+                    form.ask = None;
+                    if !instruction.is_empty() {
+                        let r = req(&form);
+                        self.ask_claude(&mut form, instruction, r);
+                    }
+                }
+                KeyCode::Backspace => {
+                    buf.pop();
+                }
+                KeyCode::Char('u') if ctrl => buf.clear(),
+                KeyCode::Char(c) if !ctrl => buf.push(c),
+                _ => {}
+            }
+            self.overlay = Overlay::Compose(form);
+            return;
+        }
         if !form.sugg.is_empty() {
             match k.code {
                 KeyCode::Down => form.sugg_sel = (form.sugg_sel + 1).min(form.sugg.len() - 1),
@@ -1310,6 +1340,15 @@ impl App {
             }
             KeyCode::Char('e') if ctrl => {
                 self.job = Some(EditorJob::Compose { req: req(&form), template: None, from: form.from.clone(), ai_thread: form.ai_thread.clone() });
+            }
+            KeyCode::Char('k') if ctrl => {
+                if form.ask_busy {
+                    self.status = "Claude is still writing…".into();
+                } else {
+                    form.ask = Some(String::new());
+                    form.sugg.clear();
+                }
+                self.overlay = Overlay::Compose(form);
             }
             KeyCode::Char('z') if ctrl => {
                 self.undo_correction(&mut form);
@@ -1407,6 +1446,47 @@ impl App {
             }
         }
         self.overlay = Overlay::Compose(form);
+    }
+
+    /// Ctrl+K: Claude writes or rewrites the message, as `instruction` says.
+    fn ask_claude(&mut self, form: &mut ComposeForm, instruction: String, req: SendReq) {
+        self.ac_gen += 1;
+        let gen = self.ac_gen;
+        form.ask_busy = true;
+        form.ask_gen = gen;
+        self.status = "✦ Claude is writing…".into();
+        let e = self.eng(&form.from.clone());
+        self.spawn_on(e, move |e| Msg::Composed { gen, r: e.ai_compose(&instruction, &req) });
+    }
+
+    fn on_composed(&mut self, gen: u64, r: Result<crate::assistant::ComposeHelp>) {
+        let Overlay::Compose(form) = &mut self.overlay else { return };
+        if form.ask_gen != gen {
+            return;
+        }
+        form.ask_busy = false;
+        match r {
+            Ok(h) if !h.body.is_empty() => {
+                let before = form.fields[4].clone();
+                form.fields[4] = h.body;
+                if !h.subject.is_empty() {
+                    form.fields[3] = h.subject;
+                }
+                form.focus = 4;
+                form.check = h.check;
+                // Claude's own text doesn't need a spelling pass straight away.
+                form.ac.checked = autocorrect::checkable(&form.fields[4]).to_string();
+                form.ac.undo = Some((before, form.fields[4].clone(), vec![]));
+                form.ac.flash.clear();
+                self.status = if form.fields[4].contains("[[") {
+                    "✦ Claude wrote it — fill in the [[gaps]], Ctrl+Z undoes".into()
+                } else {
+                    "✦ Claude wrote it — read it over, Ctrl+Z undoes, Ctrl+K to change it".into()
+                };
+            }
+            Ok(_) => self.status = "Claude came back empty — try saying more".into(),
+            Err(e) => self.status = format!("Error: {e:#}"),
+        }
     }
 
     /// Archive a thread taken care of outside email, with a note Claude learns from.
@@ -1531,10 +1611,11 @@ impl App {
         f.render_widget(Clear, r);
         let multi = self.engines.len() > 1;
         let hint = if multi {
-            " Ctrl+S send · Ctrl+D draft · Ctrl+E $EDITOR · Ctrl+F from · Tab next field · Esc discard "
+            " Ctrl+K ask Claude · Ctrl+S send · Ctrl+D draft · Ctrl+E $EDITOR · Ctrl+F from · Esc discard "
         } else {
-            " Ctrl+S send · Ctrl+D save draft · Ctrl+E open in $EDITOR · Tab next field · Esc discard "
+            " Ctrl+K ask Claude · Ctrl+S send · Ctrl+D save draft · Ctrl+E $EDITOR · Esc discard "
         };
+        let hint = if form.ask.is_some() { " ↵ ask · Esc close · e.g. “say Saturday works, ask about parking” · “shorter and warmer” " } else { hint };
         let hint = if form.sugg.is_empty() { hint } else { " ↑↓ pick · Tab/↵ add · Esc hide · keep typing to narrow " };
         let mut block = self.th.popup(&form.title).title_bottom(Line::from(hint).fg(self.th.muted));
         let ac = if !self.autocorrect_on {
@@ -1552,8 +1633,28 @@ impl App {
         }
         let inner = block.inner(r);
         f.render_widget(block, r);
-        let [hdr, sep, body] =
-            Layout::vertical([Constraint::Length(4), Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
+        // Bottom of the window: the Ask Claude bar, or what Claude says to check.
+        let mut extra: Vec<Line> = vec![];
+        if let Some(buf) = &form.ask {
+            extra.push(Line::from(vec![
+                Span::styled(" ✦ Ask Claude  ", Style::new().fg(self.th.on_chip).bg(self.th.sun).bold()),
+                Span::raw(format!(" {buf}")),
+                Span::styled("▏", Style::new().fg(self.th.sun)),
+            ]));
+        } else if form.ask_busy {
+            extra.push(Line::from(Span::styled(" ✦ Claude is writing…", Style::new().fg(self.th.sun))));
+        } else {
+            for c in form.check.iter().take(3) {
+                extra.push(Line::from(vec![Span::styled(" ⚠ ", Style::new().fg(self.th.sun)), Span::styled(c.clone(), Style::new().fg(self.th.muted))]));
+            }
+        }
+        let extra_h = if extra.is_empty() { 0 } else { extra.len() as u16 + 1 };
+        let [hdr, sep, body, bottom] =
+            Layout::vertical([Constraint::Length(4), Constraint::Length(1), Constraint::Fill(1), Constraint::Length(extra_h)]).areas(inner);
+        if !extra.is_empty() {
+            let b = Block::new().borders(Borders::TOP).border_style(Style::new().fg(self.th.rule));
+            f.render_widget(Paragraph::new(extra).wrap(Wrap { trim: true }).block(b), bottom);
+        }
         let cursor = Span::styled("▏", Style::new().fg(self.th.sun));
         let header: Vec<Line> = (0..4)
             .map(|i| {
