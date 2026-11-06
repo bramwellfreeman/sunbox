@@ -4,32 +4,34 @@ use crate::engine::{Actor, Engine, SendReq};
 use crate::models::{Template, ThreadDetail, ThreadSummary};
 use crate::{edit_text, fmt_date};
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+mod theme;
+
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton,
+    MouseEvent, MouseEventKind,
+};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use theme::Theme;
 
 const TABS: [&str; 5] = ["To do", "Primary", "Starred", "Newsletters", "All"];
-const ACCENT: Color = Color::Rgb(59, 91, 255);
-const CRAYON: Color = Color::Rgb(255, 200, 40);
-const MUTED: Color = Color::Rgb(142, 142, 153);
-const AVATARS: [Color; 6] = [
-    Color::Rgb(239, 108, 87),
-    Color::Rgb(94, 172, 112),
-    Color::Rgb(91, 130, 230),
-    Color::Rgb(201, 120, 220),
-    Color::Rgb(232, 168, 56),
-    Color::Rgb(70, 180, 190),
-];
+/// Terminals at least this wide get the list + preview split.
+const SPLIT_MIN_WIDTH: u16 = 120;
+/// How long the selection has to rest before the preview is fetched.
+const PREVIEW_DELAY: Duration = Duration::from_millis(150);
 
 enum Msg {
     Inbox(Result<Vec<ThreadSummary>>),
     Searched(String, Result<Vec<ThreadSummary>>),
     Thread(Result<ThreadDetail>),
+    /// Background fetch for the preview pane.
+    Preview(String, Result<ThreadDetail>),
     /// An action finished; refresh the inbox afterwards when `reload`.
     Done { status: Result<String>, reload: bool },
 }
@@ -84,6 +86,30 @@ struct App {
     loading: bool,
     job: Option<EditorJob>,
     quit: bool,
+    th: Theme,
+    /// Threads already fetched, for the preview pane and instant opening.
+    cache: HashMap<String, ThreadDetail>,
+    fetching: HashSet<String>,
+    preview: Preview,
+    /// Where things were last drawn, for mouse hits.
+    hits: Hits,
+}
+
+#[derive(Default)]
+struct Preview {
+    id: Option<String>,
+    since: Option<Instant>,
+    scroll: u16,
+}
+
+#[derive(Default)]
+struct Hits {
+    split: bool,
+    tabs: Vec<(u16, u16, usize)>,
+    list: Rect,
+    row_height: u16,
+    preview: Rect,
+    last_click: Option<(usize, Instant)>,
 }
 
 pub fn run(engine: Engine) -> Result<()> {
@@ -104,35 +130,52 @@ pub fn run(engine: Engine) -> Result<()> {
         loading: false,
         job: None,
         quit: false,
+        th: Theme::load(),
+        cache: HashMap::new(),
+        fetching: HashSet::new(),
+        preview: Preview::default(),
+        hits: Hits::default(),
     };
     app.reload();
 
     let mut term = ratatui::init();
+    let _ = std::io::stdout().execute(EnableMouseCapture);
     let res = main_loop(&mut term, &mut app, &rx);
+    let _ = std::io::stdout().execute(DisableMouseCapture);
     ratatui::restore();
     res
 }
 
 fn main_loop(term: &mut ratatui::DefaultTerminal, app: &mut App, rx: &Receiver<Msg>) -> Result<()> {
+    let mut theme_checked = Instant::now();
     while !app.quit {
         while let Ok(m) = rx.try_recv() {
             app.on_msg(m);
         }
+        if theme_checked.elapsed() > Duration::from_secs(2) {
+            theme_checked = Instant::now();
+            if app.th.refresh() {
+                term.clear()?;
+            }
+        }
+        app.sync_preview();
         term.draw(|f| app.draw(f))?;
         if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(k) = event::read()? {
-                if k.kind == KeyEventKind::Press {
-                    app.on_key(k);
-                }
+            match event::read()? {
+                Event::Key(k) if k.kind == KeyEventKind::Press => app.on_key(k),
+                Event::Mouse(m) => app.on_mouse(m),
+                _ => {}
             }
         }
         if let Some(job) = app.job.take() {
             // Hand the terminal to $EDITOR, then come back.
+            std::io::stdout().execute(DisableMouseCapture)?;
             disable_raw_mode()?;
             std::io::stdout().execute(LeaveAlternateScreen)?;
             let edited = app.run_editor(job);
             std::io::stdout().execute(EnterAlternateScreen)?;
             enable_raw_mode()?;
+            std::io::stdout().execute(EnableMouseCapture)?;
             term.clear()?;
             match edited {
                 Ok(Some(p)) => {
@@ -179,6 +222,8 @@ impl App {
                 self.loading = false;
                 match r {
                     Ok(ts) => {
+                        // Drop cached threads that went away or grew new messages.
+                        self.cache.retain(|id, t| ts.iter().any(|s| &s.id == id && s.message_count == t.messages.len()));
                         self.inbox = ts;
                         if self.search.is_none() && self.status.ends_with('…') {
                             self.status.clear();
@@ -208,13 +253,21 @@ impl App {
                 match r {
                     Ok(t) => {
                         self.status.clear();
+                        self.cache.insert(t.id.clone(), t.clone());
                         self.view = View::Reader { t, scroll: 0, full: false };
                     }
                     Err(e) => self.status = format!("Error: {e:#}"),
                 }
             }
+            Msg::Preview(id, r) => {
+                self.fetching.remove(&id);
+                if let Ok(t) = r {
+                    self.cache.insert(id, t);
+                }
+            }
             Msg::Done { status, reload } => {
                 match status {
+                    Ok(s) if s.is_empty() => {}
                     Ok(s) => self.status = format!("✓ {s}"),
                     Err(e) => self.status = format!("Error: {e:#}"),
                 }
@@ -419,6 +472,8 @@ impl App {
                         self.clamp();
                     }
                 }
+                KeyCode::Char('J') => self.preview.scroll = self.preview.scroll.saturating_add(3),
+                KeyCode::Char('K') => self.preview.scroll = self.preview.scroll.saturating_sub(3),
                 KeyCode::Down | KeyCode::Char('j') => self.move_sel(1),
                 KeyCode::Up | KeyCode::Char('k') => self.move_sel(-1),
                 KeyCode::Char('G') | KeyCode::End => self.move_sel(i32::MAX / 2),
@@ -428,25 +483,108 @@ impl App {
                 KeyCode::Char(c @ '1'..='5') => self.set_tab(c as usize - '1' as usize),
                 KeyCode::Enter | KeyCode::Char('o') => {
                     if let Some(t) = sel {
-                        self.loading = true;
-                        self.status = "Opening…".into();
-                        let id = t.id.clone();
-                        self.spawn(move |e| {
-                            let r = e.thread(&Actor::User, &id);
-                            if r.is_ok() && t.unread {
-                                let _ = e.mark_read(&Actor::User, &id, true);
-                            }
-                            Msg::Thread(r)
-                        });
-                        if t.unread {
-                            if let Some(x) = self.inbox.iter_mut().find(|x| x.id == t.id) {
-                                x.unread = false;
-                            }
-                        }
+                        self.open_thread(t);
                     }
                 }
                 _ => {}
             },
+        }
+    }
+
+    fn open_thread(&mut self, t: ThreadSummary) {
+        let id = t.id.clone();
+        if let Some(detail) = self.cache.get(&id) {
+            self.view = View::Reader { t: detail.clone(), scroll: 0, full: false };
+            if t.unread {
+                self.spawn(move |e| Msg::Done { status: e.mark_read(&Actor::User, &id, true).map(|_| String::new()), reload: false });
+            }
+        } else {
+            self.loading = true;
+            self.status = "Opening…".into();
+            self.spawn(move |e| {
+                let r = e.thread(&Actor::User, &id);
+                if r.is_ok() && t.unread {
+                    let _ = e.mark_read(&Actor::User, &id, true);
+                }
+                Msg::Thread(r)
+            });
+        }
+        if t.unread {
+            if let Some(x) = self.inbox.iter_mut().chain(self.search.iter_mut().flat_map(|s| s.1.iter_mut())).find(|x| x.id == t.id) {
+                x.unread = false;
+            }
+        }
+    }
+
+    /// Follow the selection with the preview pane, fetching once the cursor settles.
+    fn sync_preview(&mut self) {
+        if !self.hits.split || !matches!(self.view, View::List) {
+            return;
+        }
+        let id = self.selected().map(|t| t.id);
+        if id != self.preview.id {
+            self.preview = Preview { id, since: Some(Instant::now()), scroll: 0 };
+            return;
+        }
+        let Some(id) = id else { return };
+        let settled = self.preview.since.is_some_and(|t| t.elapsed() >= PREVIEW_DELAY);
+        if settled && !self.cache.contains_key(&id) && !self.fetching.contains(&id) {
+            self.fetching.insert(id.clone());
+            self.spawn(move |e| {
+                let r = e.thread(&Actor::User, &id);
+                Msg::Preview(id, r)
+            });
+        }
+    }
+
+    fn on_mouse(&mut self, m: MouseEvent) {
+        let at = Position::new(m.column, m.row);
+        match (&self.overlay, m.kind) {
+            (Overlay::Help, MouseEventKind::Down(_)) => {
+                self.overlay = Overlay::None;
+                return;
+            }
+            (Overlay::None, _) => {}
+            _ => return,
+        }
+        let reading = matches!(self.view, View::Reader { .. });
+        match m.kind {
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                let down = m.kind == MouseEventKind::ScrollDown;
+                if let View::Reader { scroll, .. } = &mut self.view {
+                    *scroll = if down { scroll.saturating_add(3) } else { scroll.saturating_sub(3) };
+                } else if self.hits.split && self.hits.preview.contains(at) {
+                    let s = &mut self.preview.scroll;
+                    *s = if down { s.saturating_add(3) } else { s.saturating_sub(3) };
+                } else {
+                    self.move_sel(if down { 1 } else { -1 });
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) if !reading => {
+                if let Some(&(_, _, i)) = self.hits.tabs.iter().find(|(x0, x1, _)| m.row <= 1 && (*x0..*x1).contains(&m.column)) {
+                    self.set_tab(i);
+                    return;
+                }
+                let list = self.hits.list;
+                if !list.contains(at) || self.hits.row_height == 0 {
+                    return;
+                }
+                let i = self.table.offset() + ((m.row - list.y) / self.hits.row_height) as usize;
+                if i >= self.visible().len() {
+                    return;
+                }
+                let double = self.hits.last_click.is_some_and(|(j, t)| j == i && t.elapsed() < Duration::from_millis(400));
+                self.table.select(Some(i));
+                self.hits.last_click = Some((i, Instant::now()));
+                if double {
+                    self.hits.last_click = None;
+                    if let Some(t) = self.selected() {
+                        self.open_thread(t);
+                    }
+                }
+            }
+            MouseEventKind::Down(MouseButton::Right) if reading => self.leave_reader(),
+            _ => {}
         }
     }
 
@@ -627,21 +765,21 @@ impl App {
         let h = area.height.saturating_sub(2);
         let r = Rect { x: area.x + (area.width - w) / 2, y: area.y + 1, width: w, height: h };
         f.render_widget(Clear, r);
-        let block = popup(&form.title).title_bottom(
+        let block = self.th.popup(&form.title).title_bottom(
             Line::from(" Ctrl+S send · Ctrl+D save draft · Ctrl+E open in $EDITOR · Tab next field · Esc discard ")
-                .fg(MUTED),
+                .fg(self.th.muted),
         );
         let inner = block.inner(r);
         f.render_widget(block, r);
         let [hdr, sep, body] =
             Layout::vertical([Constraint::Length(4), Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
-        let cursor = Span::styled("▏", Style::new().fg(CRAYON));
+        let cursor = Span::styled("▏", Style::new().fg(self.th.crayon));
         let header: Vec<Line> = (0..4)
             .map(|i| {
                 let focused = form.focus == i;
                 let label = Span::styled(
                     format!("{:>8}  ", FIELD_NAMES[i]),
-                    if focused { Style::new().fg(CRAYON).bold() } else { Style::new().fg(MUTED) },
+                    if focused { Style::new().fg(self.th.crayon).bold() } else { Style::new().fg(self.th.muted) },
                 );
                 let mut l = vec![label, Span::raw(form.fields[i].clone())];
                 if focused {
@@ -651,7 +789,7 @@ impl App {
             })
             .collect();
         f.render_widget(Paragraph::new(header), hdr);
-        f.render_widget(Paragraph::new("─".repeat(sep.width as usize)).fg(Color::Rgb(60, 60, 66)), sep);
+        f.render_widget(Paragraph::new("─".repeat(sep.width as usize)).fg(self.th.rule), sep);
         let mut lines: Vec<Line> = form.fields[4].split('\n').map(|l| Line::raw(l.to_string())).collect();
         if form.focus == 4 {
             if let Some(last) = lines.last_mut() {
@@ -659,7 +797,7 @@ impl App {
             }
         }
         if form.fields[4].is_empty() && form.focus != 4 {
-            lines = vec![Line::from(Span::styled("Write your message…", Style::new().fg(MUTED)))];
+            lines = vec![Line::from(Span::styled("Write your message…", Style::new().fg(self.th.muted)))];
         }
         let para = Paragraph::new(lines).wrap(Wrap { trim: false }).block(Block::new().padding(Padding::horizontal(1)));
         let total = para.line_count(body.width.saturating_sub(2)) as u16;
@@ -721,143 +859,224 @@ impl App {
             Layout::vertical([Constraint::Length(2), Constraint::Fill(1), Constraint::Length(1)]).areas(f.area());
         self.draw_top(f, top);
         match &self.view {
-            View::List => self.draw_list(f, main),
+            View::List => {
+                self.hits.split = main.width >= SPLIT_MIN_WIDTH;
+                if self.hits.split {
+                    let list_w = (main.width * 2 / 5).clamp(52, 72);
+                    let [l, r] = Layout::horizontal([Constraint::Length(list_w), Constraint::Fill(1)]).areas(main);
+                    self.draw_list(f, l);
+                    self.draw_preview(f, r);
+                } else {
+                    self.hits.preview = Rect::default();
+                    self.draw_list(f, main);
+                }
+            }
             View::Reader { .. } => self.draw_reader(f, main),
         }
         self.draw_bottom(f, bottom);
         self.draw_overlay(f);
     }
 
-    fn draw_top(&self, f: &mut Frame, area: Rect) {
+    fn draw_top(&mut self, f: &mut Frame, area: Rect) {
         let counts = self.counts();
+        let rule = Block::new().borders(Borders::BOTTOM).border_style(Style::new().fg(self.th.rule));
         let mut spans = vec![
-            Span::styled(" ▌", Style::new().fg(CRAYON)),
-            Span::styled("Crayon Box ", Style::new().bold()),
+            Span::styled(" ▌", Style::new().fg(self.th.crayon)),
+            Span::styled("Crayon Box ", Style::new().fg(self.th.bright).bold()),
             Span::raw("  "),
         ];
+        self.hits.tabs.clear();
         if let Some((q, ts)) = &self.search {
-            spans.push(Span::styled(format!(" Search: {q} ({}) ", ts.len()), Style::new().fg(Color::White).bg(ACCENT)));
+            spans.push(Span::styled(format!(" Search: {q} ({}) ", ts.len()), Style::new().fg(self.th.on_chip).bg(self.th.accent)));
         } else {
+            let mut x = area.x + spans.iter().map(|s| s.width() as u16).sum::<u16>();
             for (i, name) in TABS.iter().enumerate() {
-                let label = format!(" {name} {} ", counts[i]);
-                spans.push(if i == self.tab {
-                    Span::styled(label, Style::new().fg(ACCENT).bold().underlined())
-                } else {
-                    Span::styled(label, Style::new().fg(MUTED))
-                });
+                let active = i == self.tab;
+                let name_style = if active { Style::new().fg(self.th.accent).bold() } else { Style::new().fg(self.th.muted) };
+                let count_style = if active { Style::new().fg(self.th.on_chip).bg(self.th.accent) } else { Style::new().fg(self.th.muted) };
+                let tab = [Span::styled(format!(" {name} "), name_style), Span::styled(format!(" {} ", counts[i]), count_style), Span::raw(" ")];
+                let w: u16 = tab.iter().map(|s| s.width() as u16).sum();
+                self.hits.tabs.push((x, x + w, i));
+                x += w;
+                spans.extend(tab);
             }
         }
-        let right = format!("{}[c] ✎ Compose   {} ", if self.loading { "⟳ " } else { "" }, self.me);
+        // The account name gives way to the tabs on narrow terminals.
+        let me = if area.width >= 120 { self.me.as_str() } else { "" };
+        let right = format!("{}{me} ", if self.loading { "⟳ " } else { "" });
         let [l, r] = Layout::horizontal([Constraint::Fill(1), Constraint::Length(right.chars().count() as u16)]).areas(area);
-        f.render_widget(
-            Paragraph::new(Line::from(spans)).block(Block::new().borders(Borders::BOTTOM).border_style(Style::new().fg(Color::Rgb(60, 60, 66)))),
-            l,
-        );
-        f.render_widget(
-            Paragraph::new(Span::styled(right, Style::new().fg(MUTED))).block(Block::new().borders(Borders::BOTTOM).border_style(Style::new().fg(Color::Rgb(60, 60, 66)))),
-            r,
-        );
+        f.render_widget(Paragraph::new(Line::from(spans)).block(rule.clone()), l);
+        f.render_widget(Paragraph::new(Span::styled(right, Style::new().fg(self.th.muted))).block(rule), r);
     }
 
     fn draw_list(&mut self, f: &mut Frame, area: Rect) {
+        self.hits.list = area;
+        let split = self.hits.split;
+        let th = &self.th;
         let rows: Vec<Row> = self
             .visible()
             .iter()
             .map(|t| {
                 let initial = t.from_name.chars().find(|c| c.is_alphanumeric()).unwrap_or('?').to_uppercase().to_string();
-                let color = AVATARS[t.from_email.bytes().fold(0usize, |a, b| a.wrapping_add(b as usize)) % AVATARS.len()];
-                let dot = if t.unread { Span::styled("●", Style::new().fg(ACCENT)) } else { Span::raw(" ") };
-                let name_style = if t.unread { Style::new().bold() } else { Style::new() };
+                let bar = if t.unread { Span::styled("▌", Style::new().fg(th.accent)) } else { Span::raw(" ") };
+                let avatar = Span::styled(format!(" {initial} "), Style::new().fg(th.on_chip).bg(th.avatar(&t.from_email)).bold());
+                let (name_style, subj_style) = if t.unread {
+                    (Style::new().fg(th.bright).bold(), Style::new().fg(th.bright).bold())
+                } else {
+                    (Style::new().fg(th.fg), Style::new().fg(th.fg))
+                };
                 let mut from = vec![Span::styled(t.from_name.clone(), name_style)];
                 if t.message_count > 1 {
-                    from.push(Span::styled(format!(" ({})", t.message_count), Style::new().fg(MUTED)));
+                    from.push(Span::styled(format!(" {}", t.message_count), Style::new().fg(th.muted)));
                 }
                 let mut subj = vec![];
                 if t.starred {
-                    subj.push(Span::styled("★ ", Style::new().fg(CRAYON)));
+                    subj.push(Span::styled("★ ", Style::new().fg(th.crayon)));
                 }
                 if t.needs_reply {
-                    subj.push(Span::styled("Reply ", Style::new().fg(Color::Black).bg(CRAYON)));
+                    subj.push(Span::styled(" reply ", Style::new().fg(th.on_chip).bg(th.crayon)));
                     subj.push(Span::raw(" "));
                 }
-                subj.push(Span::styled(t.subject.clone(), name_style));
-                subj.push(Span::styled(format!(" — {}", t.snippet), Style::new().fg(MUTED)));
-                Row::new(vec![
-                    Cell::from(Line::from(vec![dot, Span::raw(" "), Span::styled(format!(" {initial} "), Style::new().fg(Color::Black).bg(color).bold())])),
-                    Cell::from(Line::from(from)),
-                    Cell::from(Line::from(subj)),
-                    Cell::from(Line::from(Span::styled(fmt_date(t.date, false), Style::new().fg(MUTED))).alignment(Alignment::Right)),
-                ])
+                subj.push(Span::styled(t.subject.clone(), subj_style));
+                let date = Span::styled(fmt_date(t.date, false), Style::new().fg(if t.unread { th.accent } else { th.muted }));
+                if split {
+                    // Two-line card: sender + date, then subject, then a muted snippet.
+                    Row::new(vec![
+                        Cell::from(Text::from(vec![Line::from(vec![bar.clone(), Span::raw(" "), avatar]), Line::from(bar.clone()), Line::from(bar)])),
+                        Cell::from(Text::from(vec![
+                            Line::from(from),
+                            Line::from(subj),
+                            Line::from(Span::styled(t.snippet.clone(), Style::new().fg(th.muted))),
+                        ])),
+                        Cell::from(Line::from(date).alignment(Alignment::Right)),
+                    ])
+                    .height(3)
+                    .bottom_margin(1)
+                } else {
+                    subj.push(Span::styled(format!(" — {}", t.snippet), Style::new().fg(th.muted)));
+                    Row::new(vec![
+                        Cell::from(Line::from(vec![bar, Span::raw(" "), avatar])),
+                        Cell::from(Line::from(from)),
+                        Cell::from(Line::from(subj)),
+                        Cell::from(Line::from(date).alignment(Alignment::Right)),
+                    ])
+                }
             })
             .collect();
+        self.hits.row_height = if split { 4 } else { 1 };
         if rows.is_empty() {
             let msg = if self.loading { "Loading…" } else { "Nothing here. ✏️" };
-            f.render_widget(Paragraph::new(msg).fg(MUTED).alignment(Alignment::Center).block(Block::new().padding(Padding::top(area.height / 3))), area);
+            f.render_widget(Paragraph::new(msg).fg(th.muted).alignment(Alignment::Center).block(Block::new().padding(Padding::top(area.height / 3))), area);
             return;
         }
-        let table = Table::new(rows, [Constraint::Length(6), Constraint::Length(24), Constraint::Fill(1), Constraint::Length(8)])
-            .row_highlight_style(Style::new().bg(Color::Rgb(38, 40, 52)))
+        let widths: &[Constraint] = if split {
+            &[Constraint::Length(5), Constraint::Fill(1), Constraint::Length(8)]
+        } else {
+            &[Constraint::Length(5), Constraint::Length(24), Constraint::Fill(1), Constraint::Length(8)]
+        };
+        let table = Table::new(rows, widths.to_vec())
+            .row_highlight_style(Style::new().bg(th.selection))
             .column_spacing(1);
         f.render_stateful_widget(table, area, &mut self.table);
     }
 
-    fn draw_reader(&mut self, f: &mut Frame, area: Rect) {
-        let View::Reader { t, scroll, full } = &mut self.view else { return };
-        let mut lines: Vec<Line> = vec![
-            Line::from(Span::styled(t.subject.clone(), Style::new().bold().fg(Color::White))),
-            Line::from(Span::styled(
-                format!("{} message(s) · {}", t.messages.len(), if *full { "full view (p: clean)" } else { "clean view (p: full)" }),
-                Style::new().fg(MUTED),
-            )),
-            Line::raw(""),
-        ];
+    /// The conversation as styled lines, shared by the reader and the preview pane.
+    fn thread_lines(&self, t: &ThreadDetail, full: bool, hint: bool) -> Vec<Line<'static>> {
+        let th = &self.th;
+        let mut lines: Vec<Line> = vec![Line::from(Span::styled(t.subject.clone(), Style::new().bold().fg(th.bright)))];
+        let mut meta = format!("{} message{}", t.messages.len(), if t.messages.len() == 1 { "" } else { "s" });
+        if hint {
+            meta.push_str(if full { " · full view (p: clean)" } else { " · clean view (p: full)" });
+        }
+        lines.push(Line::from(Span::styled(meta, Style::new().fg(th.muted))));
+        lines.push(Line::raw(""));
         for (i, m) in t.messages.iter().enumerate() {
             let (name, email) = crate::gmail::split_address(&m.from);
+            let initial = name.chars().find(|c| c.is_alphanumeric()).unwrap_or('?').to_uppercase().to_string();
             lines.push(Line::from(vec![
-                Span::styled(name, Style::new().bold()),
-                Span::styled(format!("  <{email}>"), Style::new().fg(MUTED)),
-                Span::styled(format!("  {}", fmt_date(m.date, true)), Style::new().fg(MUTED)),
+                Span::styled(format!(" {initial} "), Style::new().fg(th.on_chip).bg(th.avatar(&email)).bold()),
+                Span::raw(" "),
+                Span::styled(name, Style::new().fg(th.bright).bold()),
+                Span::styled(format!("  {email}"), Style::new().fg(th.muted)),
             ]));
-            if *full {
-                lines.push(Line::from(Span::styled(format!("to {}", m.to), Style::new().fg(MUTED))));
+            lines.push(Line::from(Span::styled(format!("    {}", fmt_date(m.date, true)), Style::new().fg(th.muted))));
+            if full {
+                lines.push(Line::from(Span::styled(format!("    to {}", m.to), Style::new().fg(th.muted))));
                 if !m.cc.is_empty() {
-                    lines.push(Line::from(Span::styled(format!("cc {}", m.cc), Style::new().fg(MUTED))));
+                    lines.push(Line::from(Span::styled(format!("    cc {}", m.cc), Style::new().fg(th.muted))));
                 }
             }
             lines.push(Line::raw(""));
-            let body = if *full { &m.body } else { &m.clean_body };
+            let body = if full { &m.body } else { &m.clean_body };
             for l in body.trim().lines() {
-                lines.push(Line::raw(l.to_string()));
+                // Quoted text that survives cleaning reads as an aside.
+                if l.starts_with('>') {
+                    lines.push(Line::from(Span::styled(l.to_string(), Style::new().fg(th.muted).italic())));
+                } else {
+                    lines.push(Line::from(Span::styled(l.to_string(), Style::new().fg(th.fg))));
+                }
+            }
+            if !m.attachments.is_empty() {
+                lines.push(Line::raw(""));
             }
             for a in &m.attachments {
-                lines.push(Line::from(Span::styled(format!("📎 {} ({} KB)", a.filename, a.size / 1024), Style::new().fg(ACCENT))));
+                lines.push(Line::from(vec![
+                    Span::styled(" 📎 ", Style::new().fg(th.accent)),
+                    Span::styled(a.filename.clone(), Style::new().fg(th.accent)),
+                    Span::styled(format!("  {} KB", a.size / 1024), Style::new().fg(th.muted)),
+                ]));
             }
             if i + 1 < t.messages.len() {
                 lines.push(Line::raw(""));
-                lines.push(Line::from(Span::styled("─".repeat(40), Style::new().fg(Color::Rgb(60, 60, 66)))));
+                lines.push(Line::from(Span::styled("┄".repeat(40), Style::new().fg(th.rule))));
                 lines.push(Line::raw(""));
             }
         }
+        lines
+    }
+
+    fn draw_preview(&mut self, f: &mut Frame, area: Rect) {
+        self.hits.preview = area;
+        let block = Block::new()
+            .borders(Borders::LEFT)
+            .border_style(Style::new().fg(self.th.rule))
+            .padding(Padding::new(3, 3, 1, 0));
+        let id = self.preview.id.clone();
+        let Some(t) = id.as_ref().and_then(|id| self.cache.get(id)) else {
+            let msg = if id.is_some() { "…" } else { "" };
+            f.render_widget(Paragraph::new(msg).fg(self.th.muted).block(block), area);
+            return;
+        };
+        let lines = self.thread_lines(t, false, false);
+        let inner = block.inner(area);
+        let para = Paragraph::new(lines).wrap(Wrap { trim: false }).block(block);
+        let max = para.line_count(inner.width) as u16;
+        self.preview.scroll = self.preview.scroll.min(max.saturating_sub(inner.height / 2));
+        f.render_widget(para.scroll((self.preview.scroll, 0)), area);
+    }
+
+    fn draw_reader(&mut self, f: &mut Frame, area: Rect) {
+        let View::Reader { t, full, .. } = &self.view else { return };
+        let lines = self.thread_lines(t, *full, true);
         let width = area.width.min(100);
-        let x = area.x + (area.width - width) / 2;
-        let card = Rect { x, width, ..area };
+        let card = Rect { x: area.x + (area.width - width) / 2, width, ..area };
         let para = Paragraph::new(lines).wrap(Wrap { trim: false }).block(Block::new().padding(Padding::new(2, 2, 1, 0)));
         let max = para.line_count(card.width.saturating_sub(4)) as u16;
+        let View::Reader { scroll, .. } = &mut self.view else { return };
         *scroll = (*scroll).min(max.saturating_sub(card.height / 2));
         f.render_widget(para.scroll((*scroll, 0)), card);
     }
-
     fn draw_bottom(&self, f: &mut Frame, area: Rect) {
         let help = match self.view {
             View::List => "c compose · ↵ open · r reply · T template · e archive · s star · u read · l label · / search · g refresh · ? help · q quit",
             View::Reader { .. } => "esc back · j/k scroll · r reply · T template · f forward · e archive · s star · l label · p full/clean · ? help",
         };
         let text = if self.status.is_empty() {
-            Span::styled(format!(" {help}"), Style::new().fg(MUTED))
+            Span::styled(format!(" {help}"), Style::new().fg(self.th.muted))
         } else if self.status.starts_with("Error") {
-            Span::styled(format!(" {}", self.status), Style::new().fg(Color::Rgb(239, 108, 87)))
+            Span::styled(format!(" {}", self.status), Style::new().fg(self.th.error))
         } else {
-            Span::styled(format!(" {}", self.status), Style::new().fg(CRAYON))
+            Span::styled(format!(" {}", self.status), Style::new().fg(self.th.crayon))
         };
         f.render_widget(Paragraph::new(text), area);
     }
@@ -884,16 +1103,18 @@ impl App {
                     ("l", "add label"),
                     ("/", "search (Gmail syntax)"),
                     ("p", "reader: clean ↔ full view"),
+                    ("J K", "scroll the preview pane (wide terminals)"),
+                    ("mouse", "click to select, double-click to open, wheel scrolls, right-click back"),
                     ("g", "refresh"),
                     ("q", "quit"),
                 ];
                 let lines: Vec<Line> = keys
                     .iter()
-                    .map(|(k, d)| Line::from(vec![Span::styled(format!("{k:>10}  "), Style::new().fg(CRAYON).bold()), Span::raw(*d)]))
+                    .map(|(k, d)| Line::from(vec![Span::styled(format!("{k:>10}  "), Style::new().fg(self.th.crayon).bold()), Span::raw(*d)]))
                     .collect();
                 let r = centered(area, 70, lines.len() as u16 + 4);
                 f.render_widget(Clear, r);
-                f.render_widget(Paragraph::new(lines).block(popup(" Keys — any key to close ")), r);
+                f.render_widget(Paragraph::new(lines).block(self.th.popup(" Keys — any key to close ")), r);
             }
             Overlay::Input { kind, buf } => {
                 let title = match kind {
@@ -902,33 +1123,26 @@ impl App {
                 };
                 let r = centered(area, 70, 3);
                 f.render_widget(Clear, r);
-                f.render_widget(Paragraph::new(format!("{buf}▏")).block(popup(title)), r);
+                f.render_widget(Paragraph::new(format!("{buf}▏")).block(self.th.popup(title)), r);
             }
             Overlay::Templates { items, sel, .. } => {
                 let lines: Vec<Line> = items
                     .iter()
                     .enumerate()
                     .map(|(i, t)| {
-                        let style = if i == *sel { Style::new().fg(Color::Black).bg(CRAYON) } else { Style::new() };
+                        let style = if i == *sel { Style::new().fg(self.th.on_chip).bg(self.th.crayon) } else { Style::new() };
                         let desc = if t.description.is_empty() { t.body.lines().next().unwrap_or("") } else { &t.description };
-                        Line::from(vec![Span::styled(format!(" {:<20} ", t.name), style), Span::styled(format!(" {desc}"), Style::new().fg(MUTED))])
+                        Line::from(vec![Span::styled(format!(" {:<20} ", t.name), style), Span::styled(format!(" {desc}"), Style::new().fg(self.th.muted))])
                     })
                     .collect();
                 let r = centered(area, 72, lines.len() as u16 + 2);
                 f.render_widget(Clear, r);
-                f.render_widget(Paragraph::new(lines).block(popup(" Reply with template — ↵ choose, esc cancel ")), r);
+                f.render_widget(Paragraph::new(lines).block(self.th.popup(" Reply with template — ↵ choose, esc cancel ")), r);
             }
         }
     }
 }
 
-fn popup(title: &str) -> Block<'_> {
-    Block::bordered()
-        .style(Style::new().bg(Color::Rgb(24, 25, 32)))
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(CRAYON))
-        .title(Span::styled(title, Style::new().bold()))
-}
 
 fn centered(area: Rect, w: u16, h: u16) -> Rect {
     let w = w.min(area.width.saturating_sub(2));
