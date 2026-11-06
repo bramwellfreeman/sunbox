@@ -32,6 +32,16 @@ pub struct Config {
     pub mcp: Mcp,
     #[serde(default)]
     pub claude: Claude,
+    #[serde(default)]
+    pub tasks: Tasks,
+}
+
+/// Where "create a task" buttons send to-dos.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Tasks {
+    /// TickTick's add-tasks-by-email address (shown in TickTick's settings).
+    #[serde(default)]
+    pub email: String,
 }
 
 /// The built-in assistant (briefings, drafts, client profiles, templates).
@@ -146,7 +156,7 @@ impl Config {
             let raw = std::fs::read_to_string(&path)?;
             toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?
         } else {
-            Config { google: Google::default(), agent: Agent::default(), mcp: Mcp::default(), claude: Claude::default() }
+            Config { google: Google::default(), agent: Agent::default(), mcp: Mcp::default(), claude: Claude::default(), tasks: Tasks::default() }
         };
         if let Ok(id) = std::env::var("SUNBOX_GOOGLE_CLIENT_ID") {
             cfg.google.client_id = id;

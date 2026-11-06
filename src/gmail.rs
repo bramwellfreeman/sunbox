@@ -147,6 +147,17 @@ impl Gmail {
         Ok(self.post("/drafts", json!({ "message": msg }))?["id"].as_str().unwrap_or_default().to_string())
     }
 
+    /// These headers from the newest message in a thread ("" when missing), in order.
+    pub fn latest_headers(&self, thread_id: &str, names: &[&str]) -> Result<Vec<String>> {
+        let mut q = vec![("format", "metadata")];
+        for n in names {
+            q.push(("metadataHeaders", n));
+        }
+        let t = self.get(&format!("/threads/{thread_id}"), &q)?;
+        let last = t["messages"].as_array().and_then(|m| m.last()).cloned().unwrap_or(Value::Null);
+        Ok(names.iter().map(|n| header(&last, n)).collect())
+    }
+
     pub fn modify_thread(&self, id: &str, add: &[String], remove: &[String]) -> Result<()> {
         self.post(&format!("/threads/{id}/modify"), json!({ "addLabelIds": add, "removeLabelIds": remove }))?;
         Ok(())

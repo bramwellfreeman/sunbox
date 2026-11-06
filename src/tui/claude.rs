@@ -3,14 +3,18 @@
 
 use super::form::Form;
 use super::{App, ComposeForm, InputKind, Msg, Overlay, CLAUDE_TAB};
-use crate::models::{AiDraft, Briefing, BriefItem, Contact, Template, TemplateIdea, ThreadSummary};
+use crate::actions::Outcome;
+use crate::engine::Actor;
+use crate::models::{AiDraft, Briefing, BriefItem, Contact, SuggestedAction, Template, TemplateIdea, ThreadSummary};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 
-/// Replies Claude drafts on its own after a briefing (urgent/high items that need a reply).
-const AUTO_DRAFTS: usize = 3;
+/// Replies Claude drafts on its own after a briefing (every item that needs a reply, most urgent first).
+const AUTO_DRAFTS: usize = 12;
+/// Threads Claude reads in full after a briefing to pick their buttons.
+const AUTO_PLANS: usize = 12;
 
 #[derive(Default)]
 pub struct ClaudeState {
@@ -22,14 +26,69 @@ pub struct ClaudeState {
     /// Automatic drafts wait here and run one at a time.
     queue: VecDeque<(String, String)>,
     auto_running: Option<String>,
+    /// Threads waiting for a full read to pick their buttons, and the one being read.
+    plan_queue: VecDeque<(String, String)>,
+    planning: Option<String>,
+    /// Full reads that failed this session (not retried on their own).
+    plan_failed: HashSet<String>,
     sel: usize,
     offset: usize,
     scroll: u16,
 }
 
 enum Row<'a> {
+    /// A category heading and how many emails are under it.
+    Header(String, usize),
     Item(&'a BriefItem),
     Idea(&'a TemplateIdea),
+}
+
+impl Row<'_> {
+    fn height(&self) -> usize {
+        if matches!(self, Row::Header(..)) { 1 } else { 2 }
+    }
+}
+
+fn prio_rank(p: &str) -> u8 {
+    match p {
+        "urgent" => 0,
+        "high" => 1,
+        "normal" => 2,
+        _ => 3,
+    }
+}
+
+pub(super) fn action_icon(kind: &str) -> &'static str {
+    match kind {
+        "calendar" => "◷",
+        "task" => "☐",
+        "link" => "↗",
+        "unsubscribe" => "⊘",
+        "archive" => "▤",
+        "star" => "★",
+        "label" => "#",
+        "forward" => "→",
+        _ => "•",
+    }
+}
+
+/// The detail shown next to a button: when, where, which site, who.
+pub(super) fn action_detail(a: &SuggestedAction) -> String {
+    let when = |s: &str| {
+        chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M")
+            .map(|d| d.format("%a %b %-d, %-I:%M %p").to_string())
+            .or_else(|_| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").map(|d| d.format("%a %b %-d").to_string()))
+            .unwrap_or_else(|_| s.to_string())
+    };
+    match a.kind.as_str() {
+        "calendar" => [when(&a.start), a.location.clone()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · "),
+        "task" if !a.start.is_empty() => format!("due {}", when(&a.start)),
+        "task" => "TickTick".into(),
+        "link" => a.url.split('/').nth(2).unwrap_or_default().to_string(),
+        "forward" => a.to.clone(),
+        "label" => a.title.clone(),
+        _ => String::new(),
+    }
 }
 
 impl App {
@@ -58,16 +117,45 @@ impl App {
         }
     }
 
+    /// Items grouped under Claude's categories (its order), most urgent first in each.
     fn rows_of<'a>(&self, b: &'a Briefing) -> Vec<Row<'a>> {
         // Threads that left the inbox (archived, answered elsewhere) drop off.
-        let mut rows: Vec<Row> = b
-            .items
-            .iter()
-            .filter(|i| self.inbox.is_empty() || self.inbox.iter().any(|t| t.id == i.thread_id))
-            .map(Row::Item)
-            .collect();
-        rows.extend(b.template_ideas.iter().map(Row::Idea));
+        let live: Vec<&BriefItem> =
+            b.items.iter().filter(|i| self.inbox.is_empty() || self.inbox.iter().any(|t| t.id == i.thread_id)).collect();
+        let mut cats: Vec<String> = b.categories.clone();
+        for i in &live {
+            if !cats.iter().any(|c| c.eq_ignore_ascii_case(&i.category)) {
+                cats.push(i.category.clone());
+            }
+        }
+        let mut rows: Vec<Row> = vec![];
+        for c in &cats {
+            let mut group: Vec<&BriefItem> = live.iter().filter(|i| i.category.eq_ignore_ascii_case(c)).copied().collect();
+            if group.is_empty() {
+                continue;
+            }
+            group.sort_by_key(|i| prio_rank(&i.priority));
+            rows.push(Row::Header(if c.is_empty() { "Other".into() } else { c.clone() }, group.len()));
+            rows.extend(group.into_iter().map(Row::Item));
+        }
+        if !b.template_ideas.is_empty() {
+            rows.push(Row::Header("Template ideas".into(), b.template_ideas.len()));
+            rows.extend(b.template_ideas.iter().map(Row::Idea));
+        }
         rows
+    }
+
+    fn selected_item(&self) -> Option<BriefItem> {
+        match self.rows().get(self.claude.sel) {
+            Some(Row::Item(i)) => Some((*i).clone()),
+            _ => None,
+        }
+    }
+
+    /// A button from the briefing as it stands now.
+    pub(super) fn brief_action(&self, thread_id: &str, idx: usize) -> Option<SuggestedAction> {
+        let b = self.claude.briefing.as_ref()?;
+        b.items.iter().find(|i| i.thread_id == thread_id)?.actions.get(idx).cloned()
     }
 
     fn thread_of(&self, id: &str) -> Option<&ThreadSummary> {
@@ -82,19 +170,182 @@ impl App {
         })
     }
 
+    /// Move by `d` emails, stepping over category headings.
     pub(super) fn claude_move(&mut self, d: i32) {
-        let n = self.rows().len() as i32;
-        if n > 0 {
-            self.claude.sel = (self.claude.sel as i32 + d).clamp(0, n - 1) as usize;
-            self.claude.scroll = 0;
+        let rows = self.rows();
+        let n = rows.len() as i32;
+        if n == 0 {
+            return;
         }
+        let (step, mut left) = (d.signum(), d.unsigned_abs().min(n as u32));
+        let mut i = self.claude.sel as i32;
+        while left > 0 {
+            let mut j = i + step;
+            while (0..n).contains(&j) && matches!(rows[j as usize], Row::Header(..)) {
+                j += step;
+            }
+            if !(0..n).contains(&j) {
+                break;
+            }
+            i = j;
+            left -= 1;
+        }
+        drop(rows);
+        self.claude.sel = i as usize;
+        self.claude.scroll = 0;
+        self.plan_selected();
     }
 
     pub(super) fn claude_click(&mut self, y: u16) {
-        let i = self.claude.offset + (y / 2) as usize;
-        if i < self.rows().len() {
-            self.claude.sel = i;
-            self.claude.scroll = 0;
+        let rows = self.rows();
+        let mut top = 0;
+        for (i, r) in rows.iter().enumerate().skip(self.claude.offset) {
+            if (y as usize) < top + r.height() {
+                if !matches!(r, Row::Header(..)) {
+                    drop(rows);
+                    self.claude.sel = i;
+                    self.claude.scroll = 0;
+                    self.plan_selected();
+                }
+                return;
+            }
+            top += r.height();
+        }
+    }
+
+    /// Never rest on a heading.
+    fn fix_sel(&mut self) {
+        let rows = self.rows();
+        let n = rows.len();
+        let mut i = self.claude.sel.min(n.saturating_sub(1));
+        while i < n && matches!(rows[i], Row::Header(..)) {
+            i += 1;
+        }
+        if i >= n {
+            i = self.claude.sel.min(n.saturating_sub(1));
+            while i > 0 && matches!(rows[i], Row::Header(..)) {
+                i -= 1;
+            }
+        }
+        drop(rows);
+        self.claude.sel = i;
+    }
+
+    // ---------- buttons ----------
+
+    /// The selected email gets its full read next, if it hasn't had one.
+    pub(super) fn plan_selected(&mut self) {
+        let Some(i) = self.selected_item() else { return };
+        if i.planned || self.claude.plan_failed.contains(&i.thread_id) || self.claude.planning.as_deref() == Some(i.thread_id.as_str()) {
+            return;
+        }
+        self.claude.plan_queue.retain(|(id, _)| *id != i.thread_id);
+        self.claude.plan_queue.push_front((i.thread_id, i.account));
+        self.pump_plans();
+    }
+
+    fn pump_plans(&mut self) {
+        if self.claude.planning.is_some() {
+            return;
+        }
+        if let Some((id, account)) = self.claude.plan_queue.pop_front() {
+            self.claude.planning = Some(id.clone());
+            self.spawn_on(self.eng(&account), move |e| {
+                let r = e.ai_actions(&id);
+                Msg::Planned(id, r)
+            });
+        }
+    }
+
+    pub(super) fn on_planned(&mut self, id: String, r: anyhow::Result<Vec<SuggestedAction>>) {
+        self.claude.planning = None;
+        match r {
+            Ok(actions) => {
+                if let Some(i) = self.claude.briefing.as_mut().and_then(|b| b.items.iter_mut().find(|i| i.thread_id == id)) {
+                    i.actions = actions;
+                    i.planned = true;
+                }
+            }
+            Err(e) => {
+                self.claude.plan_failed.insert(id);
+                self.status = format!("Error: {e:#}");
+            }
+        }
+        self.pump_plans();
+    }
+
+    fn open_actions(&mut self) {
+        let Some(i) = self.selected_item() else { return };
+        if i.actions.is_empty() {
+            self.status = if i.planned { "Claude has no buttons for this one".into() } else { "Claude is still reading this one…".into() };
+            self.plan_selected();
+            return;
+        }
+        self.overlay = Overlay::Actions { thread_id: i.thread_id, account: i.account, items: i.actions, sel: 0 };
+    }
+
+    /// Run a button. Tasks need the TickTick address once.
+    pub(super) fn press_action(&mut self, thread_id: String, account: String, idx: usize, a: SuggestedAction) {
+        if a.kind == "task" && crate::config::Config::load().map(|c| c.tasks.email.trim().is_empty()).unwrap_or(true) {
+            self.overlay = Overlay::Input { kind: InputKind::TaskEmail { thread_id, account, idx }, buf: String::new() };
+            return;
+        }
+        self.status = format!("{} {}…", action_icon(&a.kind), a.label);
+        let acct = account.clone();
+        self.spawn_on(self.eng(&account), move |e| {
+            let r = e.press_action(&Actor::User, &thread_id, &a);
+            Msg::Acted { thread_id, account: acct, idx, r }
+        });
+    }
+
+    pub(super) fn on_acted(&mut self, thread_id: String, account: String, idx: usize, r: anyhow::Result<Outcome>) {
+        match r {
+            Ok(Outcome::Done(msg)) => {
+                self.status = format!("✓ {msg}");
+                let mut gone = false;
+                if let Some(a) = self
+                    .claude
+                    .briefing
+                    .as_mut()
+                    .and_then(|b| b.items.iter_mut().find(|i| i.thread_id == thread_id))
+                    .and_then(|i| i.actions.get_mut(idx))
+                {
+                    a.done = true;
+                    gone = matches!(a.kind.as_str(), "archive" | "unsubscribe");
+                }
+                let _ = self.e.update_brief_item(&thread_id, |i| {
+                    if let Some(a) = i.actions.get_mut(idx) {
+                        a.done = true;
+                    }
+                });
+                if gone {
+                    self.reload();
+                }
+            }
+            Ok(Outcome::Compose(req)) => self.open_compose(req, None, account),
+            Err(e) => self.status = format!("Error: {e:#}"),
+        }
+    }
+
+    /// Put every briefed email into a Gmail label named after its category (Sunbox/<category>).
+    fn file_into_labels(&mut self) {
+        let Some(b) = &self.claude.briefing else { return };
+        let mut by_account: std::collections::BTreeMap<String, Vec<(String, String)>> = Default::default();
+        for i in b.items.iter().filter(|i| !i.category.is_empty()) {
+            by_account.entry(i.account.clone()).or_default().push((i.thread_id.clone(), format!("Sunbox/{}", i.category)));
+        }
+        let n: usize = by_account.values().map(Vec::len).sum();
+        self.status = format!("Filing {n} emails into Sunbox/… labels…");
+        for (account, items) in by_account {
+            self.spawn_on(self.eng(&account), move |e| {
+                let failed = items.iter().filter(|(id, label)| e.label(&Actor::User, id, label, false).is_err()).count();
+                let status = if failed == 0 {
+                    Ok(format!("Filed {} emails into Sunbox/… labels", items.len()))
+                } else {
+                    Err(anyhow::anyhow!("{failed} of {} emails couldn't be labelled", items.len()))
+                };
+                Msg::Done { status, reload: false }
+            });
         }
     }
 
@@ -115,6 +366,9 @@ impl App {
         };
         if stale {
             self.run_brief();
+        } else {
+            self.fix_sel();
+            self.plan_selected();
         }
     }
 
@@ -137,17 +391,27 @@ impl App {
         self.claude.briefing_now = false;
         match r {
             Ok(b) => {
-                self.status = format!("✓ Claude ranked {} threads", b.items.len());
-                for i in b.items.iter().filter(|i| i.action == "reply" && matches!(i.priority.as_str(), "urgent" | "high")).take(AUTO_DRAFTS) {
+                self.status = format!("✓ Claude sorted {} threads into {} categories", b.items.len(), b.categories.len());
+                let mut by_prio: Vec<&BriefItem> = b.items.iter().collect();
+                by_prio.sort_by_key(|i| prio_rank(&i.priority));
+                for i in by_prio.iter().filter(|i| i.action == "reply").take(AUTO_DRAFTS) {
                     let has = self.claude.drafts.get(&i.thread_id).is_some_and(|d| d.status != "dismissed");
                     if !has && !self.claude.busy.contains(&i.thread_id) {
                         self.claude.queue.push_back((i.thread_id.clone(), i.account.clone()));
                     }
                 }
+                self.claude.plan_queue = by_prio
+                    .iter()
+                    .filter(|i| !i.planned && i.priority != "low")
+                    .take(AUTO_PLANS)
+                    .map(|i| (i.thread_id.clone(), i.account.clone()))
+                    .collect();
                 self.claude.briefing = Some(b);
                 self.claude.sel = 0;
                 self.claude.scroll = 0;
+                self.fix_sel();
                 self.pump_drafts();
+                self.pump_plans();
             }
             Err(e) => self.status = format!("Error: {e:#}"),
         }
@@ -235,7 +499,7 @@ impl App {
         let pick = match self.rows().get(self.claude.sel) {
             Some(Row::Item(i)) => Pick::Item((*i).clone()),
             Some(Row::Idea(t)) => Pick::Idea((*t).clone()),
-            None => Pick::None,
+            _ => Pick::None,
         };
         let draft = match &pick {
             Pick::Item(i) => self.claude.drafts.get(&i.thread_id).filter(|d| d.status != "dismissed").cloned(),
@@ -244,11 +508,16 @@ impl App {
         match k.code {
             KeyCode::Down | KeyCode::Char('j') => self.claude_move(1),
             KeyCode::Up | KeyCode::Char('k') => self.claude_move(-1),
-            KeyCode::Home => self.claude.sel = 0,
+            KeyCode::Home => {
+                self.claude.sel = 0;
+                self.fix_sel();
+            }
             KeyCode::End | KeyCode::Char('G') => self.claude_move(i32::MAX / 2),
             KeyCode::Char('J') | KeyCode::PageDown => self.claude.scroll = self.claude.scroll.saturating_add(3),
             KeyCode::Char('K') | KeyCode::PageUp => self.claude.scroll = self.claude.scroll.saturating_sub(3),
             KeyCode::Char('R') => self.run_brief(),
+            KeyCode::Char(' ') | KeyCode::Char('b') => self.open_actions(),
+            KeyCode::Char('F') => self.file_into_labels(),
             KeyCode::Enter => match pick {
                 Pick::Idea(t) => {
                     let tpl = Template { name: t.name, description: t.description, subject: t.subject, body: t.body, updated_at: String::new() };
@@ -354,6 +623,10 @@ impl App {
         let items: Vec<ListItem> = rows
             .iter()
             .map(|r| match r {
+                Row::Header(c, n) => ListItem::new(Line::from(vec![
+                    Span::styled(format!(" {} ", c.to_uppercase()), Style::new().fg(th.sun).bold()),
+                    Span::styled(format!("{n}"), Style::new().fg(th.muted)),
+                ])),
                 Row::Item(i) => {
                     let badge = if self.claude.busy.contains(&i.thread_id) {
                         Span::styled("  … drafting", Style::new().fg(th.muted))
@@ -366,6 +639,10 @@ impl App {
                         }
                     };
                     let mut l1 = vec![pill(&i.priority), Span::styled(format!(" {}", i.from), Style::new().fg(th.bright).bold()), badge];
+                    let icons: String = i.actions.iter().filter(|a| !a.done).map(|a| action_icon(&a.kind)).collect::<Vec<_>>().join(" ");
+                    if !icons.is_empty() {
+                        l1.push(Span::styled(format!("  {icons}"), Style::new().fg(th.accent)));
+                    }
                     if multi {
                         l1.push(Span::styled(format!("  ● {}", super::account_tag(&i.account, &self.shown)), Style::new().fg(th.avatar(&i.account))));
                     }
@@ -381,7 +658,9 @@ impl App {
             })
             .collect();
         let empty = items.is_empty();
-        self.claude.sel = self.claude.sel.min(rows.len().saturating_sub(1));
+        drop(rows);
+        self.fix_sel();
+        let rows = self.rows_of(&b);
         let mut state = ListState::default().with_selected(Some(self.claude.sel)).with_offset(self.claude.offset);
         f.render_stateful_widget(List::new(items).highlight_style(Style::new().bg(th.selection)), left, &mut state);
         self.claude.offset = state.offset();
@@ -404,6 +683,25 @@ impl App {
                 lines.push(Line::raw(""));
                 lines.push(Line::from(Span::styled(i.why.clone(), Style::new().fg(th.fg))));
                 lines.push(Line::raw(""));
+                if !i.actions.is_empty() {
+                    for (n, a) in i.actions.iter().enumerate() {
+                        let chip = if a.done { Style::new().fg(th.muted).bg(th.selection) } else { Style::new().fg(th.on_chip).bg(th.accent).bold() };
+                        let mut l = vec![
+                            Span::styled(format!(" {} {} {} ", n + 1, action_icon(&a.kind), a.label), chip),
+                            Span::styled(format!("  {}", action_detail(a)), Style::new().fg(th.muted)),
+                        ];
+                        if a.done {
+                            l.push(Span::styled("  ✓ done", Style::new().fg(th.muted)));
+                        }
+                        lines.push(Line::from(l));
+                    }
+                    let more = if i.planned { "" } else { " (Claude is still reading the whole thread)" };
+                    lines.push(Line::from(Span::styled(format!("space: pick a button{more}"), Style::new().fg(th.muted))));
+                    lines.push(Line::raw(""));
+                } else if self.claude.planning.as_deref() == Some(i.thread_id.as_str()) {
+                    lines.push(Line::from(Span::styled("✦ Claude is reading the whole thread for things to do…", Style::new().fg(th.muted))));
+                    lines.push(Line::raw(""));
+                }
                 let draft = self.claude.drafts.get(&i.thread_id).filter(|d| d.status != "dismissed");
                 if self.claude.busy.contains(&i.thread_id) {
                     lines.push(Line::from(Span::styled("✦ Claude is writing a reply…", Style::new().fg(th.sun))));
@@ -459,7 +757,7 @@ impl App {
                 lines.push(Line::raw(""));
                 lines.push(Line::from(Span::styled("↵ edit and save it as a template", Style::new().fg(th.muted))));
             }
-            None => {}
+            _ => {}
         }
         let detail = Paragraph::new(lines)
             .wrap(Wrap { trim: false })

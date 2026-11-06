@@ -29,12 +29,17 @@ sunbox                   # inbox
 - **Several inboxes at once**: in the TUI press `a`, tick inboxes with space (`A` ticks all) and press ↵.
   They merge into one list, newest first, with each row tagged by account. Replies and actions go
   through the right account, and Ctrl+F in the composer picks the sender for new mail.
-- **✦ Claude** (tab 6): Claude reads the inbox, ranks what matters with a one-line reason, and drafts
-  replies to the urgent ones. ↵ opens a draft in the composer to check, edit and send. Nothing is sent
+- **✦ Claude** (tab 6): Claude reads the inbox, picks categories that fit it (Clients, Bills, School…),
+  sorts every email under one with a priority and a one-line reason, and drafts a reply to each email
+  that needs one. Emails that need something else get one-press buttons Claude labels itself:
+  add to Google Calendar (opens prefilled for you to save), add a TickTick task (by email: set
+  `[tasks] email` or enter it on first use), open the link the email is about, unsubscribe
+  (one-click, email or page), archive, star, label or forward. `space` opens them, `F` files every
+  email into a `Sunbox/<category>` Gmail label. ↵ opens a draft in the composer to check, edit and send. Nothing is sent
   without you, and sending is blocked while `[[gaps]]` Claude couldn't fill remain. `w` redrafts with
   your note, `L` has Claude study a sender. It runs on the Claude Code CLI (your plan) or, with
   `ANTHROPIC_API_KEY`, the API. Set `model`, `effort` and an `about` line under `[claude]` in the config.
-  CLI: `sunbox claude brief|draft|drafts|learn|template|status`.
+  CLI: `sunbox claude brief|actions|do|draft|drafts|learn|template|status`.
 - **Templates** (`t`) and **People** (`P`): edit everything in the app. `w` has Claude write a
   template from a description and `W` revises one, both opening for review. Client profiles grow a
   "learned by Claude" section from your mail, and you can edit it like any other field.

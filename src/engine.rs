@@ -162,7 +162,7 @@ impl Engine {
         Ok(found.account)
     }
 
-    fn gmail(&self) -> Result<Gmail> {
+    pub(crate) fn gmail(&self) -> Result<Gmail> {
         let now = chrono::Utc::now().timestamp();
         let mut cached = self.token.lock().unwrap();
         if let Some((tok, exp)) = cached.as_ref() {

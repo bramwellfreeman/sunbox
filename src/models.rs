@@ -181,6 +181,9 @@ pub struct Briefing {
     pub created_at: String,
     pub accounts: Vec<String>,
     pub summary: String,
+    /// The categories Claude chose for this inbox, in display order.
+    #[serde(default)]
+    pub categories: Vec<String>,
     pub items: Vec<BriefItem>,
     #[serde(default)]
     pub template_ideas: Vec<TemplateIdea>,
@@ -202,6 +205,42 @@ pub struct BriefItem {
     pub why: String,
     /// reply · follow_up · read · archive · none
     pub action: String,
+    /// One-press buttons Claude picked for this email.
+    #[serde(default)]
+    pub actions: Vec<SuggestedAction>,
+    /// The buttons came from reading the whole thread, not just the snippet.
+    #[serde(default)]
+    pub planned: bool,
+}
+
+/// A button Claude suggests. `kind` picks what runs; the other fields are its details
+/// ("" when they don't apply).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SuggestedAction {
+    /// calendar · task · link · unsubscribe · archive · star · label · forward
+    pub kind: String,
+    /// Button text, e.g. "Add rehearsal Sat 3pm".
+    pub label: String,
+    /// Event / task title, label name.
+    #[serde(default)]
+    pub title: String,
+    /// Local "2026-11-08T15:00" or an all-day "2026-11-08"; for tasks, the due date.
+    #[serde(default)]
+    pub start: String,
+    #[serde(default)]
+    pub end: String,
+    #[serde(default)]
+    pub location: String,
+    #[serde(default)]
+    pub url: String,
+    /// Forward recipient.
+    #[serde(default)]
+    pub to: String,
+    /// Event description, task notes, forward note.
+    #[serde(default)]
+    pub note: String,
+    #[serde(default)]
+    pub done: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

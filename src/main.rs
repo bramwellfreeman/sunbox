@@ -1,3 +1,4 @@
+mod actions;
 mod ai;
 mod assistant;
 mod cleaning;
@@ -134,6 +135,10 @@ enum ClaudeCmd {
         #[arg(long)]
         note: Option<String>,
     },
+    /// Have Claude read a whole thread and suggest its one-press buttons.
+    Actions { thread_id: String },
+    /// Press button N (from `actions` or the briefing) on a thread.
+    Do { thread_id: String, n: usize },
     /// Replies Claude has drafted.
     Drafts,
     /// Read recent mail with someone and update their profile.
@@ -358,17 +363,65 @@ fn claude_cmd(e: &Engine, json: bool, c: ClaudeCmd) -> Result<()> {
             eprintln!("Asking Claude about {} threads…", threads.len());
             let b = e.brief(&threads, &accounts)?;
             print(json, &b, |b| {
-                println!("{}
-", b.summary);
+                println!("{}\n", b.summary);
+                let mut cats = b.categories.clone();
                 for i in &b.items {
-                    println!("{:>7}  {:<9} {} — {}
-         {}", i.priority, i.action, i.from, i.subject, i.why);
+                    if !cats.contains(&i.category) {
+                        cats.push(i.category.clone());
+                    }
+                }
+                for c in &cats {
+                    let group: Vec<_> = b.items.iter().filter(|i| &i.category == c).collect();
+                    if group.is_empty() {
+                        continue;
+                    }
+                    println!("── {} ({})", if c.is_empty() { "Other" } else { c }, group.len());
+                    for i in group {
+                        println!("{:>7}  {:<9} {} — {}\n         {}", i.priority, i.action, i.from, i.subject, i.why);
+                        for (n, a) in i.actions.iter().enumerate() {
+                            println!("         [{}] {} ({})", n + 1, a.label, a.kind);
+                        }
+                    }
                 }
                 for t in &b.template_ideas {
                     println!("
 Template idea “{}”: {}", t.name, t.why);
                 }
             })?;
+        }
+        ClaudeCmd::Actions { thread_id } => {
+            let acts = e.ai_actions(&thread_id)?;
+            print(json, &acts, |acts| {
+                if acts.is_empty() {
+                    println!("Nothing to do for this one besides reading or replying.");
+                }
+                for (n, a) in acts.iter().enumerate() {
+                    println!("[{}] {} ({}) {} {} {}", n + 1, a.label, a.kind, a.start, a.location, a.url);
+                }
+            })?;
+        }
+        ClaudeCmd::Do { thread_id, n } => {
+            let b = e.last_briefing()?.ok_or_else(|| anyhow!("no briefing yet — run `sunbox claude brief`"))?;
+            let a = b
+                .items
+                .iter()
+                .find(|i| i.thread_id == thread_id)
+                .and_then(|i| i.actions.get(n.wrapping_sub(1)))
+                .cloned()
+                .ok_or_else(|| anyhow!("no button {n} on that thread"))?;
+            match e.press_action(&Actor::User, &thread_id, &a)? {
+                actions::Outcome::Done(msg) => {
+                    let _ = e.update_brief_item(&thread_id, |i| {
+                        if let Some(a) = i.actions.get_mut(n - 1) {
+                            a.done = true;
+                        }
+                    });
+                    ok(json, &msg)
+                }
+                actions::Outcome::Compose(r) => {
+                    println!("This one opens the composer — draft:\nTo: {}\nSubject: {}\n\n{}", r.to, r.subject, r.body)
+                }
+            }
         }
         ClaudeCmd::Draft { thread_id, note } => {
             let d = e.ai_draft(&thread_id, note.as_deref())?;

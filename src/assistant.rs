@@ -47,6 +47,36 @@ struct ProfileOut {
     learned: String,
 }
 
+const ACTION_RULES: &str = "Button kinds: calendar (an event, appointment, rehearsal, booking or deadline \
+worth having on the calendar: title, start as local \"YYYY-MM-DDTHH:MM\" or all-day \"YYYY-MM-DD\", end if known, \
+location), task (a to-do such as paying an invoice, signing or returning a form: title, start = due date if any, \
+note), link (open the page the email is really about, e.g. pay, RSVP, sign up, track, a form: url must be a link that \
+appears in the email, never guessed; leave it out if you can't see the link), unsubscribe (bulk mail the user doesn't \
+seem to want), archive (nothing to do), star (keep for later), label (title = label name), forward (to = address, \
+note = one line). `label` is the button text, short and specific (\"Add rehearsal Sat 3pm\", \"Pay $120 invoice\"). \
+Use \"\" for fields that don't apply. Don't add a button for replying; drafts are handled separately.";
+
+fn actions_schema() -> Value {
+    json!({"type": "array", "items": obj(json!({
+        "kind": {"type": "string", "enum": ["calendar", "task", "link", "unsubscribe", "archive", "star", "label", "forward"]},
+        "label": s(), "title": s(), "start": s(), "end": s(), "location": s(), "url": s(), "to": s(), "note": s(),
+    }))})
+}
+
+/// Every http(s) link in some text, in order, without duplicates.
+fn links_in(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    for w in text.split(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"' | '(' | ')' | '[' | ']')) {
+        if w.starts_with("https://") || w.starts_with("http://") {
+            let w = w.trim_end_matches(['.', ',', ';', ':']).to_string();
+            if !out.contains(&w) {
+                out.push(w);
+            }
+        }
+    }
+    out
+}
+
 const PROFILE_RULES: &str = "Profile rules: `learned` is a concise running profile of the other person, at most ~120 words \
 as short lines: who they are to the user, what they usually want, how they write and like to be written to, \
 preferences, recurring patterns (timing, scheduling habits, payment habits), and anything still open. Rewrite it \
@@ -149,7 +179,10 @@ impl Engine {
                  Rank what deserves the user's attention. Return `items` for every personal thread plus any notable \
                  notification, most important first. priority: urgent (needs action today), high, normal, low. \
                  action: reply, follow_up (the user is waiting on someone), read, archive, none. `why` is one short \
-                 sentence a busy person can scan. `category` is a word or two (booking, invoice, scheduling, school…). \
+                 sentence a busy person can scan. First choose 3 to 8 `categories` that fit THIS inbox (one or two \
+                 words each, e.g. Clients, Bookings, Bills, School, Family, Orders, Newsletters), ordered from most to \
+                 least important, and give every item exactly one of them as `category`. In `actions`, add 0 to 3 \
+                 one-press buttons for what the user would do besides replying. {ACTION_RULES} \
                  `summary` is two or three sentences on the day's inbox. In `template_ideas`, suggest up to 3 \
                  reusable reply templates only for kinds of email the user clearly answers again and again and that \
                  no existing template covers (use {{{{first_name}}}} style placeholders); otherwise return [].",
@@ -165,12 +198,14 @@ impl Engine {
             );
             let schema = obj(json!({
                 "summary": s(),
+                "categories": {"type": "array", "items": s()},
                 "items": {"type": "array", "items": obj(json!({
                     "thread_id": s(),
                     "priority": {"type": "string", "enum": ["urgent", "high", "normal", "low"]},
                     "category": s(),
                     "why": s(),
                     "action": {"type": "string", "enum": ["reply", "follow_up", "read", "archive", "none"]},
+                    "actions": actions_schema(),
                 }))},
                 "template_ideas": {"type": "array", "items": obj(json!({
                     "name": s(), "description": s(), "subject": s(), "body": s(), "why": s(),
@@ -181,9 +216,14 @@ impl Engine {
                 created_at: now(),
                 accounts: accounts.to_vec(),
                 summary: v["summary"].as_str().unwrap_or_default().to_string(),
+                categories: serde_json::from_value(v["categories"].clone()).unwrap_or_default(),
                 items: serde_json::from_value(v["items"].clone()).unwrap_or_default(),
                 template_ideas: serde_json::from_value(v["template_ideas"].clone()).unwrap_or_default(),
             };
+            // Snippets carry no links, so link buttons wait for the full read (ai_actions).
+            for i in &mut b.items {
+                i.actions.retain(|a| a.kind != "link");
+            }
             // Keep only threads we actually know, and fill in who/what for display.
             b.items.retain_mut(|i| match threads.iter().find(|t| t.id == i.thread_id) {
                 Some(t) => {
@@ -197,6 +237,43 @@ impl Engine {
             self.store.ai_put("briefing", &b)?;
             Ok(b)
         })
+    }
+
+    /// Read the whole thread and pick its buttons properly (the briefing only sees snippets).
+    /// Saves them into the stored briefing.
+    pub fn ai_actions(&self, thread_id: &str) -> Result<Vec<SuggestedAction>> {
+        let actor = claude_actor();
+        let me = self.account()?;
+        let t = self.thread(&actor, thread_id)?;
+        let links: Vec<String> = t.messages.iter().flat_map(|m| links_in(&m.body)).take(60).collect();
+        let prompt = format!(
+            "Pick the one-press buttons for this email thread.\n\n<thread subject=\"{}\">\n{}\n</thread>\n\n\
+             Links in the thread:\n{}\n\nReturn 0 to 3 `actions`, the most useful first. {ACTION_RULES}",
+            t.subject,
+            t.transcript,
+            if links.is_empty() { "(none)".to_string() } else { links.join("\n") },
+        );
+        let schema = obj(json!({"actions": actions_schema()}));
+        let v = self.act(&actor, "read", "claude_actions", thread_id, || self.claude().json(&self.system_prompt(&me), &prompt, &schema))?;
+        let mut actions: Vec<SuggestedAction> = serde_json::from_value(v["actions"].clone()).unwrap_or_default();
+        // A link has to be one that's really in the mail.
+        actions.retain(|a| a.kind != "link" || links.contains(&a.url));
+        self.update_brief_item(thread_id, |i| {
+            i.actions = actions.clone();
+            i.planned = true;
+        })?;
+        Ok(actions)
+    }
+
+    /// Change one item of the stored briefing.
+    pub fn update_brief_item(&self, thread_id: &str, f: impl FnOnce(&mut BriefItem)) -> Result<()> {
+        if let Some(mut b) = self.last_briefing()? {
+            if let Some(i) = b.items.iter_mut().find(|i| i.thread_id == thread_id) {
+                f(i);
+                self.store.ai_put("briefing", &b)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn last_briefing(&self) -> Result<Option<Briefing>> {
@@ -364,5 +441,14 @@ impl Engine {
             body: v["body"].as_str().unwrap_or_default().to_string(),
             updated_at: String::new(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn finds_links() {
+        let l = super::links_in("Pay here: https://pay.x.com/inv/1. Or <https://x.com/a> and https://pay.x.com/inv/1 again");
+        assert_eq!(l, vec!["https://pay.x.com/inv/1", "https://x.com/a"]);
     }
 }

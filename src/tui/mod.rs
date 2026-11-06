@@ -1,7 +1,8 @@
 //! Interactive inbox: Tempo-style tabs + list + reader, $EDITOR for writing.
 
 use crate::engine::{Actor, Engine, SendReq};
-use crate::models::{AiDraft, Briefing, Contact, Template, ThreadDetail, ThreadSummary};
+use crate::actions::Outcome;
+use crate::models::{AiDraft, Briefing, Contact, SuggestedAction, Template, ThreadDetail, ThreadSummary};
 use crate::{edit_text, fmt_date};
 use anyhow::Result;
 mod claude;
@@ -57,12 +58,16 @@ enum Msg {
     Learned(Result<Contact>),
     /// Claude wrote a template (unsaved, opens in the editor).
     AiTemplate(Result<Template>),
+    /// Claude read a whole thread and picked its buttons.
+    Planned(String, Result<Vec<SuggestedAction>>),
+    /// A suggested-action button finished.
+    Acted { thread_id: String, account: String, idx: usize, r: Result<Outcome> },
 }
 
 impl Msg {
     /// Results that stay valid when the shown inboxes change.
     fn outlives_epoch(&self) -> bool {
-        matches!(self, Msg::SignedIn(_) | Msg::Briefed(_) | Msg::Drafted(..) | Msg::Learned(_) | Msg::AiTemplate(_))
+        matches!(self, Msg::SignedIn(_) | Msg::Briefed(_) | Msg::Drafted(..) | Msg::Learned(_) | Msg::AiTemplate(_) | Msg::Planned(..) | Msg::Acted { .. })
     }
 }
 
@@ -81,6 +86,8 @@ enum InputKind {
     ClaudeNote { thread_id: String, account: String },
     /// Ask Claude for a new template, or to revise one.
     TemplateAsk { base: Option<Template> },
+    /// First "create task" press: ask for the TickTick add-by-email address.
+    TaskEmail { thread_id: String, account: String, idx: usize },
 }
 
 /// The in-app compose window.
@@ -108,6 +115,8 @@ enum Overlay {
     Accounts(AccountsList),
     /// Editing a template or a contact profile.
     Form(Form),
+    /// The buttons Claude suggested for one email.
+    Actions { thread_id: String, account: String, items: Vec<SuggestedAction>, sel: usize },
 }
 
 struct AccountsList {
@@ -438,6 +447,8 @@ impl App {
             Msg::Briefed(r) => self.on_briefed(r),
             Msg::Drafted(id, r) => self.on_drafted(id, r),
             Msg::Learned(r) => self.on_learned(r),
+            Msg::Planned(id, r) => self.on_planned(id, r),
+            Msg::Acted { thread_id, account, idx, r } => self.on_acted(thread_id, account, idx, r),
             Msg::AiTemplate(r) => match r {
                 Ok(t) => {
                     self.status = "✓ Claude wrote a template — check it, then Ctrl+S to save".into();
@@ -545,6 +556,26 @@ impl App {
             }
             Overlay::Form(form) => {
                 self.form_key(form, k);
+                return;
+            }
+            Overlay::Actions { thread_id, account, items, mut sel } => {
+                let pick = match k.code {
+                    KeyCode::Enter => Some(sel),
+                    KeyCode::Char(c @ '1'..='9') => Some(c as usize - '1' as usize).filter(|i| *i < items.len()),
+                    _ => None,
+                };
+                match (pick, k.code) {
+                    (Some(i), _) => self.press_action(thread_id, account, i, items[i].clone()),
+                    (None, KeyCode::Esc | KeyCode::Char('q')) => {}
+                    (None, code) => {
+                        match code {
+                            KeyCode::Down | KeyCode::Char('j') => sel = (sel + 1).min(items.len().saturating_sub(1)),
+                            KeyCode::Up | KeyCode::Char('k') => sel = sel.saturating_sub(1),
+                            _ => {}
+                        }
+                        self.overlay = Overlay::Actions { thread_id, account, items, sel };
+                    }
+                }
                 return;
             }
             Overlay::Templates { items, mut sel, reply_to, from } => {
@@ -976,6 +1007,25 @@ impl App {
                 self.spawn_search(buf, 50, move |per| Msg::Searched(q, per));
             }
             InputKind::ClaudeNote { thread_id, account } => self.start_draft(thread_id, account, Some(buf)),
+            InputKind::TaskEmail { thread_id, account, idx } => {
+                if !buf.contains('@') {
+                    self.status = "That doesn't look like an email address".into();
+                    return;
+                }
+                let saved = crate::config::Config::load().and_then(|mut c| {
+                    c.tasks.email = buf.clone();
+                    c.save()
+                });
+                match saved {
+                    Err(e) => self.status = format!("Error: {e:#}"),
+                    Ok(()) => {
+                        let a = self.brief_action(&thread_id, idx);
+                        if let Some(a) = a {
+                            self.press_action(thread_id, account, idx, a);
+                        }
+                    }
+                }
+            }
             InputKind::TemplateAsk { base } => {
                 self.status = match &base {
                     Some(t) => format!("Claude is revising “{}”…", t.name),
@@ -1522,7 +1572,7 @@ impl App {
     fn draw_bottom(&self, f: &mut Frame, area: Rect) {
         let help = match &self.view {
             View::List if self.tab == CLAUDE_TAB && self.search.is_none() => {
-                "↵ check & send · w redraft with a note · D draft · o open · e archive · x dismiss · L learn sender · R refresh · ? help"
+                "space actions · ↵ check & send · w redraft · D draft · o open · e archive · x dismiss · F file into labels · L learn · R refresh"
             }
             View::Library(l) if l.kind == LibKind::Templates => {
                 "↵ edit · n new · w Claude writes one · W Claude revises · x delete · esc back"
@@ -1547,6 +1597,24 @@ impl App {
             Overlay::None => {}
             Overlay::Compose(form) => self.draw_compose(f, form),
             Overlay::Form(form) => form.draw(f, &self.th),
+            Overlay::Actions { items, sel, .. } => {
+                let lines: Vec<Line> = items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, a)| {
+                        let style = if i == *sel { Style::new().fg(self.th.on_chip).bg(self.th.sun) } else { Style::new().fg(self.th.fg) };
+                        let tick = if a.done { "✓" } else { " " };
+                        Line::from(vec![
+                            Span::styled(format!(" {} {tick} ", i + 1), Style::new().fg(self.th.sun).bold()),
+                            Span::styled(format!(" {} {} ", claude::action_icon(&a.kind), a.label), style),
+                            Span::styled(format!("  {}", claude::action_detail(a)), Style::new().fg(self.th.muted)),
+                        ])
+                    })
+                    .collect();
+                let r = centered(area, 86, lines.len() as u16 + 2);
+                f.render_widget(Clear, r);
+                f.render_widget(Paragraph::new(lines).block(self.th.popup(" Do it — 1-9 or ↵ · esc close ")), r);
+            }
             Overlay::Help => {
                 let keys = [
                     ("Tab / 1-6", "switch tab (To do · Primary · Starred · Newsletters · All · ✦ Claude)"),
@@ -1567,7 +1635,9 @@ impl App {
                     ("J K", "scroll the preview pane (wide terminals)"),
                     ("mouse", "click to select, double-click to open, wheel scrolls, right-click back"),
                     ("a", "inboxes: tick several to show together · add · default · sign out"),
-                    ("6", "✦ Claude: what matters, drafted replies to check & send"),
+                    ("6", "✦ Claude: your inbox sorted into categories, drafted replies to check & send"),
+                    ("space", "✦ Claude: the buttons Claude suggests (calendar, task, link, unsubscribe…)"),
+                    ("F", "✦ Claude: file every email into a Sunbox/<category> Gmail label"),
                     ("t", "templates: edit yours, or have Claude write one"),
                     ("P", "people: client profiles Claude learns from your mail"),
                     ("g", "refresh"),
@@ -1588,6 +1658,7 @@ impl App {
                     InputKind::ClaudeNote { .. } => " Tell Claude how to reply (e.g. “decline politely, offer next week”) ",
                     InputKind::TemplateAsk { base: None } => " Describe the template (e.g. “booking confirmation with date, venue and deposit”) ",
                     InputKind::TemplateAsk { base: Some(_) } => " How should Claude change it? ",
+                    InputKind::TaskEmail { .. } => " Your TickTick add-tasks-by-email address (from TickTick's settings) ",
                 };
                 let r = centered(area, 70, 3);
                 f.render_widget(Clear, r);
