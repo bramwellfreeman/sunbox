@@ -30,6 +30,11 @@ sunbox                   # inbox
 - **Several inboxes at once**: in the TUI press `a`, tick inboxes with space (`A` ticks all) and press ↵.
   They merge into one list, newest first, with each row tagged by account. Replies and actions go
   through the right account, and Ctrl+F in the composer picks the sender for new mail.
+- **⚙ Settings** (top right, or `,`): **Accounts** (switch, add, default, sign out, show inboxes
+  together) and **AI assistant**: pick Claude (Claude Code or an API key), ChatGPT (Codex CLI or an
+  OpenAI key) or Gemini (Gemini CLI or a Google AI Studio key). ↵ signs in if needed and switches,
+  `m` sets the model, `t` sends a test question, `u` tells it about you. Keys are saved in the
+  config file (chmod 600); `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GEMINI_API_KEY` work too.
 - **✦ Claude** (tab 7): Claude reads the inbox, picks categories that fit it (Clients, Bills, School…),
   sorts every email under one with a priority and a one-line reason, and drafts a reply to each email
   that needs one. Emails that need something else get one-press buttons Claude labels itself:

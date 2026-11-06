@@ -9,6 +9,7 @@ mod autocorrect;
 mod claude;
 mod form;
 mod library;
+mod settings;
 mod theme;
 
 use crossterm::event::{
@@ -44,6 +45,8 @@ const SHOWN_KEY: &str = "tui_shown_accounts";
 type PerAccount = Vec<(String, Result<Vec<ThreadSummary>>)>;
 
 enum Msg {
+    /// Which AI assistants are signed in (Settings).
+    AiReady(Vec<std::result::Result<bool, String>>),
     Inbox(PerAccount),
     Sent(PerAccount),
     /// Claude's spelling fixes for the composer text it was given.
@@ -73,7 +76,7 @@ enum Msg {
 impl Msg {
     /// Results that stay valid when the shown inboxes change.
     fn outlives_epoch(&self) -> bool {
-        matches!(self, Msg::SignedIn(_) | Msg::Briefed(_) | Msg::Drafted(..) | Msg::Learned(_) | Msg::AiTemplate(_) | Msg::Planned(..) | Msg::Acted { .. })
+        matches!(self, Msg::AiReady(_) | Msg::SignedIn(_) | Msg::Briefed(_) | Msg::Drafted(..) | Msg::Learned(_) | Msg::AiTemplate(_) | Msg::Planned(..) | Msg::Acted { .. })
     }
 }
 
@@ -94,6 +97,10 @@ enum InputKind {
     TemplateAsk { base: Option<Template> },
     /// First "create task" press: ask for the TickTick add-by-email address.
     TaskEmail { thread_id: String, account: String, idx: usize },
+    /// Settings → AI assistant: paste an API key, set a model, describe yourself.
+    AiKey { provider: String },
+    AiModel { provider: String },
+    AiAbout,
 }
 
 /// The in-app compose window.
@@ -146,6 +153,9 @@ enum Overlay {
     Accounts(AccountsList),
     /// Editing a template or a contact profile.
     Form(Form),
+    /// ⚙ menu (top right) and its AI assistant page.
+    Settings { sel: usize },
+    Assistant(settings::Assistant),
     /// The buttons Claude suggested for one email.
     Actions { thread_id: String, account: String, items: Vec<SuggestedAction>, sel: usize },
     /// Contacts search: type to filter, ↵ writes to them.
@@ -167,6 +177,8 @@ enum EditorJob {
     Compose { req: SendReq, template: Option<Template>, from: String, ai_thread: Option<String> },
     /// Edit the focused field of a form.
     Field(Form),
+    /// Run an AI provider's own sign-in in the terminal.
+    SignIn(String),
 }
 
 struct App {
@@ -527,6 +539,7 @@ impl App {
             Msg::Learned(r) => self.on_learned(r),
             Msg::Planned(id, r) => self.on_planned(id, r),
             Msg::Acted { thread_id, account, idx, r } => self.on_acted(thread_id, account, idx, r),
+            Msg::AiReady(r) => self.on_ai_ready(r),
             Msg::AiTemplate(r) => match r {
                 Ok(t) => {
                     self.status = "✓ Claude wrote a template — check it, then Ctrl+S to save".into();
@@ -612,6 +625,14 @@ impl App {
                 return;
             }
             Overlay::Help => return,
+            Overlay::Settings { sel } => {
+                self.settings_key(sel, k);
+                return;
+            }
+            Overlay::Assistant(a) => {
+                self.assistant_key(a, k);
+                return;
+            }
             Overlay::Input { kind, mut buf } => {
                 match k.code {
                     KeyCode::Esc => {}
@@ -733,6 +754,10 @@ impl App {
             KeyCode::Char('C') => {
                 let items = self.people(&self.me, "", PEOPLE_ROWS);
                 self.overlay = Overlay::People { query: String::new(), items, sel: 0 };
+                return;
+            }
+            KeyCode::Char(',') => {
+                self.open_settings();
                 return;
             }
             KeyCode::Char('a') => {
@@ -1040,7 +1065,7 @@ impl App {
             }
             MouseEventKind::Down(MouseButton::Left) if !reading => {
                 if self.hits.account.contains(at) {
-                    self.open_accounts();
+                    self.open_settings();
                     return;
                 }
                 if let Some(&(_, _, i)) = self.hits.tabs.iter().find(|(x0, x1, _)| m.row <= 1 && (*x0..*x1).contains(&m.column)) {
@@ -1121,6 +1146,7 @@ impl App {
                 self.spawn_search(buf, 50, move |per| Msg::Searched(q, per));
             }
             InputKind::ClaudeNote { thread_id, account } => self.start_draft(thread_id, account, Some(buf)),
+            kind @ (InputKind::AiKey { .. } | InputKind::AiModel { .. } | InputKind::AiAbout) => self.submit_assistant_input(kind, buf),
             InputKind::TaskEmail { thread_id, account, idx } => {
                 if !buf.contains('@') {
                     self.status = "That doesn't look like an email address".into();
@@ -1575,6 +1601,7 @@ impl App {
 
     fn run_job(&mut self, job: EditorJob) {
         match job {
+            EditorJob::SignIn(id) => self.run_sign_in(&id),
             EditorJob::Field(mut form) => {
                 if let Err(e) = form.edit_focused_in_editor() {
                     self.status = format!("Error: {e:#}");
@@ -1698,17 +1725,9 @@ impl App {
                 spans.extend(tab);
             }
         }
-        // The account name gives way to the tabs on narrow terminals (`a` still shows it).
-        let many = format!("{} inboxes", self.shown.len());
-        let me = match (area.width >= 120, self.shown.len() > 1) {
-            (false, _) => "",
-            (true, true) => many.as_str(),
-            (true, false) => self.me.as_str(),
-        };
         let right = Line::from(vec![
             Span::styled(if self.loading { "⟳ " } else { "" }, Style::new().fg(self.th.muted)),
-            Span::styled(me, Style::new().fg(self.th.muted)),
-            Span::styled(" ⇄ ", Style::new().fg(self.th.accent)),
+            Span::styled(" ⚙ ", Style::new().fg(self.th.accent).bold()),
         ]);
         let [l, r] = Layout::horizontal([Constraint::Fill(1), Constraint::Length(right.width() as u16)]).areas(area);
         self.hits.account = r;
@@ -1932,6 +1951,8 @@ impl App {
             Overlay::None => {}
             Overlay::Compose(form) => self.draw_compose(f, form),
             Overlay::Form(form) => form.draw(f, &self.th),
+            Overlay::Settings { sel } => self.draw_settings(f, *sel),
+            Overlay::Assistant(a) => self.draw_assistant(f, a),
             Overlay::Actions { items, sel, .. } => {
                 let lines: Vec<Line> = items
                     .iter()
@@ -1971,6 +1992,7 @@ impl App {
                     ("J K", "scroll the preview pane (wide terminals)"),
                     ("mouse", "click to select, double-click to open, wheel scrolls, right-click back"),
                     ("a", "inboxes: tick several to show together · add · default · sign out"),
+                    (",  ⚙", "settings: accounts, and which AI assistant to use (Claude, ChatGPT, Gemini)"),
                     ("6", "Sent: what you sent, and who hasn't replied yet"),
                     ("7", "✦ Claude: your inbox sorted into categories, drafted replies to check & send"),
                     ("space", "✦ Claude: the buttons Claude suggests (calendar, task, link, unsubscribe…)"),
@@ -1996,10 +2018,18 @@ impl App {
                     InputKind::TemplateAsk { base: None } => " Describe the template (e.g. “booking confirmation with date, venue and deposit”) ",
                     InputKind::TemplateAsk { base: Some(_) } => " How should Claude change it? ",
                     InputKind::TaskEmail { .. } => " Your TickTick add-tasks-by-email address (from TickTick's settings) ",
+                    InputKind::AiKey { .. } => " Paste the API key (saved in your Sunbox config, readable only by you) ",
+                    InputKind::AiModel { .. } => " Model name (leave empty for the default) ",
+                    InputKind::AiAbout => " A line about you and your work, so the assistant knows what matters ",
                 };
                 let r = centered(area, 70, 3);
                 f.render_widget(Clear, r);
-                f.render_widget(Paragraph::new(format!("{buf}▏")).block(self.th.popup(title)), r);
+                let shown = if matches!(kind, InputKind::AiKey { .. }) && buf.len() > 4 {
+                    format!("{}{}", "•".repeat(buf.chars().count() - 4), buf.chars().skip(buf.chars().count() - 4).collect::<String>())
+                } else {
+                    buf.clone()
+                };
+                f.render_widget(Paragraph::new(format!("{shown}▏")).block(self.th.popup(title)), r);
             }
             Overlay::Accounts(list) => {
                 let mut lines: Vec<Line> = list
@@ -2023,7 +2053,7 @@ impl App {
                 lines.push(Line::from(Span::styled(hint, Style::new().fg(self.th.muted))));
                 let r = centered(area, 84, lines.len() as u16 + 2);
                 f.render_widget(Clear, r);
-                f.render_widget(Paragraph::new(lines).block(self.th.popup(" Inboxes — tick the ones to show together ")), r);
+                f.render_widget(Paragraph::new(lines).block(self.th.popup(" ⚙ Accounts — tick the inboxes to show together ")), r);
             }
             Overlay::People { query, items, sel } => {
                 let r = centered(area, 88, PEOPLE_ROWS as u16 + 5);

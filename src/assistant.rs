@@ -93,13 +93,18 @@ relationship is one or two words (client, venue, family, vendor, colleague, stud
 
 impl Engine {
     fn claude(&self) -> Claude {
-        Claude::new(&self.cfg.claude)
+        Claude::new(&self.assistant_cfg())
+    }
+
+    /// The assistant settings as saved now (Settings changes apply without a restart).
+    pub fn assistant_cfg(&self) -> crate::config::Claude {
+        crate::config::Config::load().map(|c| c.claude).unwrap_or_else(|_| self.cfg.claude.clone())
     }
 
     /// Spelling/typo fixes for text the user is writing. Touches no mail, so it isn't audited
     /// (it runs on every pause while typing). Uses the quick autocorrect settings.
     pub fn autocorrect(&self, text: &str) -> Result<Vec<Fix>> {
-        let mut cfg = self.cfg.claude.clone();
+        let mut cfg = self.assistant_cfg();
         if !cfg.autocorrect_model.trim().is_empty() {
             cfg.model = cfg.autocorrect_model.clone();
         }

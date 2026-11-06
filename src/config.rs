@@ -69,6 +69,18 @@ pub struct Claude {
     pub autocorrect_model: String,
     #[serde(default = "default_autocorrect_effort")]
     pub autocorrect_effort: String,
+    /// API keys pasted in Settings (this file is chmod 600). Env vars work too.
+    #[serde(default)]
+    pub anthropic_key: String,
+    #[serde(default)]
+    pub openai_key: String,
+    #[serde(default)]
+    pub gemini_key: String,
+    /// Models for the other assistants ("" = that tool's default).
+    #[serde(default)]
+    pub openai_model: String,
+    #[serde(default)]
+    pub gemini_model: String,
 }
 
 fn default_true() -> bool {
@@ -94,7 +106,8 @@ fn default_command() -> String {
 impl Default for Claude {
     fn default() -> Self {
         Self { backend: default_backend(), model: default_model(), effort: default_effort(), command: default_command(), about: String::new(),
-            autocorrect: true, autocorrect_model: String::new(), autocorrect_effort: default_autocorrect_effort() }
+            autocorrect: true, autocorrect_model: String::new(), autocorrect_effort: default_autocorrect_effort(),
+            anthropic_key: String::new(), openai_key: String::new(), gemini_key: String::new(), openai_model: String::new(), gemini_model: String::new() }
     }
 }
 
