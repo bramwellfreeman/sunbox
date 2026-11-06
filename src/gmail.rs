@@ -89,6 +89,13 @@ impl Gmail {
             .into_iter()
             .collect();
         let (from_name, from_email) = split_address(&header(&last, "From"));
+        // The recipients of the user's latest message in the thread, for the Sent view.
+        let sent_to = msgs
+            .iter()
+            .rev()
+            .find(|m| split_address(&header(m, "From")).1.eq_ignore_ascii_case(me))
+            .map(|m| header(m, "To"))
+            .unwrap_or_default();
         // Gmail's own tabs are the strongest signal: anything outside Primary is bulk.
         let categorized = labels.iter().any(|l| {
             matches!(l.as_str(), "CATEGORY_PROMOTIONS" | "CATEGORY_UPDATES" | "CATEGORY_SOCIAL" | "CATEGORY_FORUMS")
@@ -108,6 +115,7 @@ impl Gmail {
             from_email,
             labels,
             account: String::new(),
+            to: sent_to,
         })
     }
 

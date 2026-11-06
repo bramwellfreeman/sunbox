@@ -26,9 +26,11 @@ use form::Form;
 use library::{LibKind, Library};
 use theme::Theme;
 
-const TABS: [&str; 6] = ["To do", "Primary", "Starred", "Newsletters", "All", "✦ Claude"];
+const TABS: [&str; 7] = ["To do", "Primary", "Starred", "Newsletters", "All", "Sent", "✦ Claude"];
+/// Mail you sent (its own fetch, not a filter on the inbox).
+const SENT_TAB: usize = 5;
 /// The Claude panel's tab.
-const CLAUDE_TAB: usize = 5;
+const CLAUDE_TAB: usize = 6;
 /// Terminals at least this wide get the list + preview split.
 const SPLIT_MIN_WIDTH: u16 = 120;
 /// How long the selection has to rest before the preview is fetched.
@@ -41,6 +43,7 @@ type PerAccount = Vec<(String, Result<Vec<ThreadSummary>>)>;
 
 enum Msg {
     Inbox(PerAccount),
+    Sent(PerAccount),
     Searched(String, PerAccount),
     Thread(Result<ThreadDetail>),
     /// Background fetch for the preview pane.
@@ -147,6 +150,10 @@ struct App {
     /// A browser sign-in is waiting on Google.
     signing_in: bool,
     inbox: Vec<ThreadSummary>,
+    sent: Vec<ThreadSummary>,
+    /// Sent is fetched the first time its tab opens, then kept fresh with the inbox.
+    sent_loaded: bool,
+    sent_loading: bool,
     search: Option<(String, Vec<ThreadSummary>)>,
     tab: usize,
     table: TableState,
@@ -197,6 +204,9 @@ pub fn run(engine: Engine) -> Result<()> {
         epoch: 0,
         signing_in: false,
         inbox: vec![],
+        sent: vec![],
+        sent_loaded: false,
+        sent_loading: false,
         search: None,
         tab: 0,
         table: TableState::default().with_selected(0),
@@ -335,6 +345,17 @@ impl App {
     fn reload(&mut self) {
         self.loading = true;
         self.spawn_search("in:inbox".into(), 60, Msg::Inbox);
+        if self.sent_loaded || self.tab == SENT_TAB {
+            self.reload_sent();
+        }
+    }
+
+    fn reload_sent(&mut self) {
+        if self.sent_loading {
+            return;
+        }
+        self.sent_loading = true;
+        self.spawn_search("in:sent".into(), 60, Msg::Sent);
     }
 
     fn do_action(&mut self, label: &'static str, t: &ThreadSummary, f: impl FnOnce(&Engine, &str) -> Result<()> + Send + 'static) {
@@ -361,6 +382,9 @@ impl App {
         self.shown = shown;
         self.epoch += 1;
         self.inbox.clear();
+        self.sent.clear();
+        self.sent_loaded = false;
+        self.sent_loading = false;
         self.search = None;
         self.cache.clear();
         self.fetching.clear();
@@ -397,7 +421,8 @@ impl App {
                 }
                 let ts = self.merge(per);
                 // Drop cached threads that went away or grew new messages.
-                self.cache.retain(|id, t| ts.iter().any(|s| &s.id == id && s.message_count == t.messages.len()));
+                let sent = &self.sent;
+                self.cache.retain(|id, t| ts.iter().chain(sent).any(|s| &s.id == id && s.message_count == t.messages.len()));
                 self.inbox = ts;
                 // Land on a non-empty tab the first time.
                 if self.visible().is_empty() && self.tab == 0 && !self.inbox.is_empty() {
@@ -405,6 +430,14 @@ impl App {
                 }
                 self.clamp();
                 self.maybe_auto_brief();
+            }
+            Msg::Sent(per) => {
+                self.sent_loading = false;
+                self.sent_loaded = true;
+                self.sent = self.merge(per);
+                if self.tab == SENT_TAB {
+                    self.clamp();
+                }
             }
             Msg::Searched(q, per) => {
                 self.loading = false;
@@ -476,6 +509,9 @@ impl App {
         if let Some((_, ts)) = &self.search {
             return ts.iter().collect();
         }
+        if self.tab == SENT_TAB {
+            return self.sent.iter().collect();
+        }
         self.inbox
             .iter()
             .filter(|t| match self.tab {
@@ -489,9 +525,9 @@ impl App {
             .collect()
     }
 
-    fn counts(&self) -> [usize; 6] {
+    fn counts(&self) -> [usize; 7] {
         let c = |f: fn(&ThreadSummary) -> bool| self.inbox.iter().filter(|t| f(t)).count();
-        [c(|t| t.needs_reply), c(|t| !t.is_bulk), c(|t| t.starred), c(|t| t.is_bulk), self.inbox.len(), self.ready_drafts()]
+        [c(|t| t.needs_reply), c(|t| !t.is_bulk), c(|t| t.starred), c(|t| t.is_bulk), self.inbox.len(), self.sent.len(), self.ready_drafts()]
     }
 
     fn clamp(&mut self) {
@@ -502,11 +538,11 @@ impl App {
 
     fn selected(&self) -> Option<ThreadSummary> {
         if let View::Reader { t, .. } = &self.view {
-            return self.inbox.iter().chain(self.search.iter().flat_map(|s| s.1.iter())).find(|s| s.id == t.id).cloned()
+            return self.inbox.iter().chain(&self.sent).chain(self.search.iter().flat_map(|s| s.1.iter())).find(|s| s.id == t.id).cloned()
                 .or_else(|| Some(ThreadSummary {
                     id: t.id.clone(), subject: t.subject.clone(), from_name: String::new(), from_email: String::new(),
                     snippet: String::new(), date: 0, message_count: t.messages.len(), unread: false, starred: false,
-                    needs_reply: false, is_bulk: false, labels: vec![], account: t.account.clone(),
+                    needs_reply: false, is_bulk: false, labels: vec![], account: t.account.clone(), to: String::new(),
                 }));
         }
         if matches!(self.view, View::List) && self.tab == CLAUDE_TAB && self.search.is_none() {
@@ -744,7 +780,7 @@ impl App {
                 KeyCode::Home => self.table.select(Some(0)),
                 KeyCode::Tab | KeyCode::Right => self.set_tab((self.tab + 1) % TABS.len()),
                 KeyCode::BackTab | KeyCode::Left => self.set_tab((self.tab + TABS.len() - 1) % TABS.len()),
-                KeyCode::Char(c @ '1'..='6') => self.set_tab(c as usize - '1' as usize),
+                KeyCode::Char(c @ '1'..='7') => self.set_tab(c as usize - '1' as usize),
                 KeyCode::Enter | KeyCode::Char('o') => {
                     if let Some(t) = sel {
                         self.open_thread(t);
@@ -984,6 +1020,9 @@ impl App {
         self.search = None;
         self.tab = t;
         self.table.select(Some(0));
+        if t == SENT_TAB && !self.sent_loaded {
+            self.reload_sent();
+        }
         if t == CLAUDE_TAB {
             self.maybe_auto_brief();
         }
@@ -1473,19 +1512,31 @@ impl App {
         let split = self.hits.split;
         let multi = self.shown.len() > 1;
         let th = &self.th;
+        let sent_tab = self.tab == SENT_TAB && self.search.is_none();
         let rows: Vec<Row> = self
             .visible()
             .iter()
             .map(|t| {
-                let initial = t.from_name.chars().find(|c| c.is_alphanumeric()).unwrap_or('?').to_uppercase().to_string();
+                // Sent rows show the person you wrote to.
+                let (who, who_email) = if sent_tab {
+                    (recipients(&t.to), crate::gmail::split_address(t.to.split(',').next().unwrap_or("")).1)
+                } else {
+                    (t.from_name.clone(), t.from_email.clone())
+                };
+                let initial = who.chars().find(|c| c.is_alphanumeric()).unwrap_or('?').to_uppercase().to_string();
                 let bar = if t.unread { Span::styled("▌", Style::new().fg(th.accent)) } else { Span::raw(" ") };
-                let avatar = Span::styled(format!(" {initial} "), Style::new().fg(th.on_chip).bg(th.avatar(&t.from_email)).bold());
+                let avatar = Span::styled(format!(" {initial} "), Style::new().fg(th.on_chip).bg(th.avatar(&who_email)).bold());
                 let (name_style, subj_style) = if t.unread {
                     (Style::new().fg(th.bright).bold(), Style::new().fg(th.bright).bold())
                 } else {
                     (Style::new().fg(th.fg), Style::new().fg(th.fg))
                 };
-                let mut from = vec![Span::styled(t.from_name.clone(), name_style)];
+                // In Sent, a row is about who you wrote to, and whether they've answered.
+                let mut from = if sent_tab {
+                    vec![Span::styled("To ", Style::new().fg(th.muted)), Span::styled(recipients(&t.to), name_style)]
+                } else {
+                    vec![Span::styled(t.from_name.clone(), name_style)]
+                };
                 if t.message_count > 1 {
                     from.push(Span::styled(format!(" {}", t.message_count), Style::new().fg(th.muted)));
                 }
@@ -1493,7 +1544,14 @@ impl App {
                 if t.starred {
                     subj.push(Span::styled("★ ", Style::new().fg(th.sun)));
                 }
-                if t.needs_reply {
+                if sent_tab {
+                    if t.from_email.eq_ignore_ascii_case(&t.account) {
+                        subj.push(Span::styled("no reply yet ", Style::new().fg(th.muted).italic()));
+                    } else {
+                        subj.push(Span::styled(" replied ", Style::new().fg(th.on_chip).bg(th.accent)));
+                        subj.push(Span::raw(" "));
+                    }
+                } else if t.needs_reply {
                     subj.push(Span::styled(" reply ", Style::new().fg(th.on_chip).bg(th.sun)));
                     subj.push(Span::raw(" "));
                 }
@@ -1533,7 +1591,7 @@ impl App {
             .collect();
         self.hits.row_height = if split { 4 } else { 1 };
         if rows.is_empty() {
-            let msg = if self.loading { "Loading…" } else { "Nothing here. ✏️" };
+            let msg = if self.loading || (sent_tab && !self.sent_loaded) { "Loading…" } else { "Nothing here. ✏️" };
             f.render_widget(Paragraph::new(msg).fg(th.muted).alignment(Alignment::Center).block(Block::new().padding(Padding::top(area.height / 3))), area);
             return;
         }
@@ -1667,7 +1725,7 @@ impl App {
             Overlay::Form(form) => form.draw(f, &self.th),
             Overlay::Help => {
                 let keys = [
-                    ("Tab / 1-6", "switch tab (To do · Primary · Starred · Newsletters · All · ✦ Claude)"),
+                    ("Tab / 1-7", "switch tab (To do · Primary · Starred · Newsletters · All · Sent · ✦ Claude)"),
                     ("j k ↑ ↓", "move / scroll"),
                     ("↵  o", "open thread"),
                     ("esc", "back / clear search"),
@@ -1686,7 +1744,8 @@ impl App {
                     ("J K", "scroll the preview pane (wide terminals)"),
                     ("mouse", "click to select, double-click to open, wheel scrolls, right-click back"),
                     ("a", "inboxes: tick several to show together · add · default · sign out"),
-                    ("6", "✦ Claude: what matters, drafted replies to check & send"),
+                    ("6", "Sent: what you sent, and who hasn't replied yet"),
+                    ("7", "✦ Claude: what matters, drafted replies to check & send"),
                     ("t", "templates: edit yours, or have Claude write one"),
                     ("P", "people: client profiles Claude learns from your mail"),
                     ("g", "refresh"),
@@ -1769,6 +1828,18 @@ impl App {
     }
 }
 
+
+/// "Jane Doe, sam@x.org" from a To header: names where there are names.
+fn recipients(to: &str) -> String {
+    if to.trim().is_empty() {
+        return "(no recipient)".into();
+    }
+    to.split(',')
+        .map(|a| crate::gmail::split_address(a.trim()))
+        .map(|(name, email)| if name.trim().is_empty() { email } else { name })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// Short account label for list rows: the part before the @, plus a bit of the
 /// domain when another shown account has the same name (bram@b… vs bram@e…).

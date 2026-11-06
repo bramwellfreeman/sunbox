@@ -16,7 +16,7 @@ sunbox                   # inbox
 
 ## Use it
 
-- **TUI**: `sunbox`. Tabs To do · Primary · Starred · Newsletters · All. `↵` opens a thread, `r` replies,
+- **TUI**: `sunbox`. Tabs To do · Primary · Starred · Newsletters · All · Sent (who you wrote to, and who hasn't replied yet) · ✦ Claude. `↵` opens a thread, `r` replies,
   `T` replies from a template, `c` composes, `f` forwards, `e` archives, `s` stars, `l` labels,
   `/` searches, `C` finds a contact, `?` shows help. In To/Cc/Bcc, start typing a name or address
   and pick a suggestion with ↑↓ + Tab/↵. You write in `$EDITOR`, then choose send / draft / edit again / discard.

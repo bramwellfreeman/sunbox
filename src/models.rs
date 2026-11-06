@@ -21,6 +21,9 @@ pub struct ThreadSummary {
     /// Which signed-in account it lives in.
     #[serde(default)]
     pub account: String,
+    /// Who the user last wrote to in this thread (for the Sent view).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub to: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
