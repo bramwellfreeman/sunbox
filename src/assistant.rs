@@ -13,6 +13,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 
+/// What Claude wrote for the composer.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ComposeHelp {
+    pub body: String,
+    /// "" keeps the current subject.
+    pub subject: String,
+    pub check: Vec<String>,
+}
+
 /// One spelling fix: replace the word `from` with `to`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Fix {
@@ -456,6 +465,57 @@ impl Engine {
             let _ = self.apply_profile(&other_email, &other_name, p);
         }
         Ok(d)
+    }
+
+    /// Claude writes (or rewrites) the message open in the composer, following `instruction`.
+    /// Uses the thread when it's a reply, the recipients' profiles and the user's templates.
+    pub fn ai_compose(&self, instruction: &str, req: &SendReq) -> Result<ComposeHelp> {
+        let actor = claude_actor();
+        let me = self.account()?;
+        let thread = match &req.reply_to_thread {
+            Some(id) => {
+                let t = self.thread(&actor, id)?;
+                format!("This is a reply in this thread:\n<thread subject=\"{}\">\n{}\n</thread>\n\n", t.subject, t.transcript)
+            }
+            None => String::new(),
+        };
+        let mut people = String::new();
+        for a in req.to.split(',').chain(req.cc.split(',')).filter(|a| a.contains('@')).take(4) {
+            let (name, email) = split_address(a.trim());
+            let email = email.to_lowercase();
+            people.push_str(&format!("- {name} <{email}>: {}\n", Self::profile_text(&self.store.contact(&email)?)));
+        }
+        let templates = self.store.templates()?;
+        let tpl_text = templates
+            .iter()
+            .map(|t| format!("### {}\n{}\nSubject: {}\n{}\n", t.name, t.description, t.subject, t.body))
+            .collect::<String>();
+        let prompt = format!(
+            "{thread}The email being written:\nTo: {}\nCc: {}\nSubject: {}\n<draft>\n{}\n</draft>\n\n\
+             Recipients: \n{}\nThe user's templates (placeholders look like {{{{first_name}}}}):\n{}\n\
+             The user asks: {instruction}\n\n\
+             Rules: if the draft already has text, revise it as asked and keep what the user wrote unless they asked \
+             to change it; if it's empty, write the email. Write as the user, in the first person, in their voice and \
+             the recipient's preferred tone. Plain text, brief and concrete, no quoted history; sign off the way the \
+             user does. Never invent facts such as prices, dates, times, links or availability: write [[what's needed]] \
+             in the body and list it in `check`, along with anything else to verify. `subject` is a short subject line \
+             when the current one is empty (or the user asked for one), otherwise \"\" to keep it.",
+            req.to,
+            req.cc,
+            req.subject,
+            req.body.trim(),
+            if people.is_empty() { "(none yet)\n".into() } else { people },
+            if tpl_text.is_empty() { "(none)\n".into() } else { tpl_text },
+        );
+        let schema = obj(json!({"body": s(), "subject": s(), "check": {"type": "array", "items": s()}}));
+        let v = self.act(&actor, "draft", "claude_compose", instruction, || {
+            self.claude().json(&self.system_prompt(&me), &prompt, &schema)
+        })?;
+        Ok(ComposeHelp {
+            body: v["body"].as_str().unwrap_or_default().trim().to_string(),
+            subject: v["subject"].as_str().unwrap_or_default().trim().to_string(),
+            check: serde_json::from_value(v["check"].clone()).unwrap_or_default(),
+        })
     }
 
     pub fn ai_drafts(&self) -> Result<Vec<AiDraft>> {
