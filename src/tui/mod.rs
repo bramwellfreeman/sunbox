@@ -101,6 +101,8 @@ enum InputKind {
     AiKey { provider: String },
     AiModel { provider: String },
     AiAbout,
+    /// "Handled another way": a note for Claude, then archive.
+    HandledNote { thread_id: String, account: String },
 }
 
 /// The in-app compose window.
@@ -834,6 +836,10 @@ impl App {
                     self.overlay = Overlay::Input { kind: InputKind::Label, buf: String::new() };
                     return;
                 }
+                KeyCode::Char('H') => {
+                    self.overlay = Overlay::Input { kind: InputKind::HandledNote { thread_id: id, account: acct }, buf: String::new() };
+                    return;
+                }
                 _ => {}
             }
         }
@@ -1135,6 +1141,11 @@ impl App {
 
     fn submit_input(&mut self, kind: InputKind, buf: String) {
         let buf = buf.trim().to_string();
+        // A handled note is optional: ↵ on its own still archives.
+        if let InputKind::HandledNote { thread_id, account } = kind {
+            self.mark_handled(thread_id, account, buf);
+            return;
+        }
         if buf.is_empty() {
             return;
         }
@@ -1147,6 +1158,7 @@ impl App {
             }
             InputKind::ClaudeNote { thread_id, account } => self.start_draft(thread_id, account, Some(buf)),
             kind @ (InputKind::AiKey { .. } | InputKind::AiModel { .. } | InputKind::AiAbout) => self.submit_assistant_input(kind, buf),
+            InputKind::HandledNote { .. } => {} // taken above
             InputKind::TaskEmail { thread_id, account, idx } => {
                 if !buf.contains('@') {
                     self.status = "That doesn't look like an email address".into();
@@ -1395,6 +1407,21 @@ impl App {
             }
         }
         self.overlay = Overlay::Compose(form);
+    }
+
+    /// Archive a thread taken care of outside email, with a note Claude learns from.
+    fn mark_handled(&mut self, thread_id: String, account: String, note: String) {
+        if matches!(self.view, View::Reader { .. }) {
+            self.leave_reader();
+        }
+        self.status = "Archiving as handled…".into();
+        self.spawn_on(self.eng(&account), move |e| Msg::Done {
+            status: e.mark_handled(&Actor::User, &thread_id, &note).map(|h| {
+                let who = if h.from_name.is_empty() { h.from_email } else { h.from_name };
+                format!("Handled & archived — Claude will remember this mattered{}", if who.is_empty() { String::new() } else { format!(" to {who}") })
+            }),
+            reload: true,
+        });
     }
 
     /// After a character lands in the body: fix a just-finished word from the typo list.
@@ -1926,13 +1953,13 @@ impl App {
     fn draw_bottom(&self, f: &mut Frame, area: Rect) {
         let help = match &self.view {
             View::List if self.tab == CLAUDE_TAB && self.search.is_none() => {
-                "space actions · ↵ check & send · w redraft · D draft · o open · e archive · x dismiss · F file into labels · L learn · R refresh"
+                "space actions · ↵ check & send · w redraft · D draft · o open · e archive · H handled · x dismiss · F labels · L learn · R refresh"
             }
             View::Library(l) if l.kind == LibKind::Templates => {
                 "↵ edit · n new · w Claude writes one · W Claude revises · x delete · esc back"
             }
             View::Library(_) => "↵ edit · n new · L Claude learns from their mail · x delete · esc back",
-            View::List => "c compose · ↵ open · r reply · T template · e archive · s star · / search · C contacts · t templates · P people · a inboxes · ? help",
+            View::List => "c compose · ↵ open · r reply · T template · e archive · H handled · s star · / search · C contacts · t templates · P people · a inboxes · ? help",
             View::Reader { .. } => "esc back · j/k scroll · r reply · T template · f forward · e archive · s star · l label · p full/clean · ? help",
         };
         let text = if self.status.is_empty() {
@@ -1986,6 +2013,7 @@ impl App {
                     ("s", "star / unstar (to do)"),
                     ("u", "mark read / unread"),
                     ("l", "add label"),
+                    ("H", "handled another way: add a note, archive, and Claude remembers it mattered"),
                     ("/", "search (Gmail syntax)"),
                     ("C", "contacts: find someone, ↵ to write to them"),
                     ("p", "reader: clean ↔ full view"),
@@ -2021,6 +2049,7 @@ impl App {
                     InputKind::AiKey { .. } => " Paste the API key (saved in your Sunbox config, readable only by you) ",
                     InputKind::AiModel { .. } => " Model name (leave empty for the default) ",
                     InputKind::AiAbout => " A line about you and your work, so the assistant knows what matters ",
+                    InputKind::HandledNote { .. } => " How did you handle it? (e.g. “called her”) · ↵ archives ",
                 };
                 let r = centered(area, 70, 3);
                 f.render_widget(Clear, r);

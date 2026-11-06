@@ -64,6 +64,13 @@ enum Cmd {
     Send(SendArgs),
     /// Remove a thread from the inbox.
     Archive { thread_id: String },
+    /// Archive a thread you took care of another way, with a note Claude learns from.
+    /// Without a thread id, lists what you've marked handled.
+    Handled {
+        thread_id: Option<String>,
+        #[arg(long, default_value = "")]
+        note: String,
+    },
     /// Star a thread (Sunbox's "To do"); --off to unstar.
     Star {
         thread_id: String,
@@ -598,6 +605,18 @@ fn run(cli: Cli) -> Result<()> {
             let _ = e.mark_read(&me, &thread_id, true);
         }
         Cmd::Send(args) => send_cmd(&e, json, args)?,
+        Cmd::Handled { thread_id: Some(id), note } => {
+            let h = e.mark_handled(&me, &id, &note)?;
+            ok(json, &format!("handled & archived “{}” — noted on {}'s profile", h.subject, if h.from_name.is_empty() { &h.from_email } else { &h.from_name }));
+        }
+        Cmd::Handled { thread_id: None, .. } => {
+            let hs = e.handled(50)?;
+            print(json, &hs, |hs| {
+                for h in hs {
+                    println!("{}  {} — {}\n            {}", &h.at[..h.at.len().min(10)], h.from_name, h.subject, h.note);
+                }
+            })?;
+        }
         Cmd::Archive { thread_id } => {
             e.archive(&me, &thread_id)?;
             ok(json, "archived");

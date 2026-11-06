@@ -68,6 +68,7 @@ pub(super) fn action_icon(kind: &str) -> &'static str {
         "star" => "★",
         "label" => "#",
         "forward" => "→",
+        "handled" => "✓",
         _ => "•",
     }
 }
@@ -276,16 +277,29 @@ impl App {
 
     fn open_actions(&mut self) {
         let Some(i) = self.selected_item() else { return };
-        if i.actions.is_empty() {
-            self.status = if i.planned { "Claude has no buttons for this one".into() } else { "Claude is still reading this one…".into() };
+        if !i.planned {
             self.plan_selected();
-            return;
         }
-        self.overlay = Overlay::Actions { thread_id: i.thread_id, account: i.account, items: i.actions, sel: 0 };
+        // "Handled" is always there, after whatever Claude suggested.
+        let mut items = i.actions;
+        items.push(SuggestedAction {
+            kind: "handled".into(),
+            label: "Handled another way — note & archive".into(),
+            note: "Claude remembers it mattered".into(),
+            ..Default::default()
+        });
+        if !i.planned {
+            self.status = "Claude is still reading this one — more buttons may appear".into();
+        }
+        self.overlay = Overlay::Actions { thread_id: i.thread_id, account: i.account, items, sel: 0 };
     }
 
     /// Run a button. Tasks need the TickTick address once.
     pub(super) fn press_action(&mut self, thread_id: String, account: String, idx: usize, a: SuggestedAction) {
+        if a.kind == "handled" {
+            self.overlay = Overlay::Input { kind: InputKind::HandledNote { thread_id, account }, buf: String::new() };
+            return;
+        }
         if a.kind == "task" && crate::config::Config::load().map(|c| c.tasks.email.trim().is_empty()).unwrap_or(true) {
             self.overlay = Overlay::Input { kind: InputKind::TaskEmail { thread_id, account, idx }, buf: String::new() };
             return;

@@ -302,3 +302,16 @@ pub struct AiDraft {
     /// ready · sent · saved · dismissed
     pub status: String,
 }
+
+/// An email the user marked as handled another way (a call, in person, elsewhere): important,
+/// but taken care of. Claude reads these as signals.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Handled {
+    pub thread_id: String,
+    pub account: String,
+    pub from_name: String,
+    pub from_email: String,
+    pub subject: String,
+    pub note: String,
+    pub at: String,
+}
