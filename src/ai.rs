@@ -273,16 +273,27 @@ pub fn ready(id: &str, cfg: &config::Claude) -> Result<bool, String> {
             Ok(o) => Ok(o.status.success() && !String::from_utf8_lossy(&o.stdout).to_lowercase().contains("not logged in")),
             Err(_) => Err("the Codex CLI isn't installed (npm i -g @openai/codex)".into()),
         },
-        "gemini" => match quiet("gemini", &["--version"]) {
-            Ok(_) => Ok(dirs::home_dir().is_some_and(|h| h.join(".gemini/oauth_creds.json").exists())
-                || key(&cfg.gemini_key, "GEMINI_API_KEY").is_some()),
-            Err(_) => Err("the Gemini CLI isn't installed (npm i -g @google/gemini-cli)".into()),
-        },
+        // Starting the Gemini CLI takes seconds, so just look for it and its saved sign-in.
+        "gemini" if !on_path("gemini") => Err("the Gemini CLI isn't installed (npm i -g @google/gemini-cli)".into()),
+        "gemini" => Ok(dirs::home_dir().is_some_and(|h| h.join(".gemini/oauth_creds.json").exists())
+            || key(&cfg.gemini_key, "GEMINI_API_KEY").is_some()),
         "api" => Ok(key(&cfg.anthropic_key, "ANTHROPIC_API_KEY").is_some()),
         "openai" => Ok(key(&cfg.openai_key, "OPENAI_API_KEY").is_some()),
         "gemini-api" => Ok(key(&cfg.gemini_key, "GEMINI_API_KEY").is_some()),
         _ => Ok(false),
     }
+}
+
+/// Every provider's `ready`, checked side by side.
+pub fn ready_all(cfg: &config::Claude) -> Vec<Result<bool, String>> {
+    std::thread::scope(|s| {
+        let hs: Vec<_> = PROVIDERS.iter().map(|p| s.spawn(move || ready(p.id, cfg))).collect();
+        hs.into_iter().map(|h| h.join().unwrap_or(Ok(false))).collect()
+    })
+}
+
+fn on_path(prog: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(prog).is_file()))
 }
 
 fn key(saved: &str, env: &str) -> Option<String> {

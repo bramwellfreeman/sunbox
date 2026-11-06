@@ -64,7 +64,7 @@ impl App {
     /// Ask every provider whether it's signed in (CLIs take a moment, so off the UI thread).
     pub(super) fn check_assistants(&self) {
         let cfg = self.e.assistant_cfg();
-        self.spawn(move |_| Msg::AiReady(PROVIDERS.iter().map(|p| ai::ready(p.id, &cfg)).collect()));
+        self.spawn(move |_| Msg::AiReady(ai::ready_all(&cfg)));
     }
 
     pub(super) fn on_ai_ready(&mut self, r: Vec<Result<bool, String>>) {
