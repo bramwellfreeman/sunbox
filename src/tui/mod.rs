@@ -5,6 +5,7 @@ use crate::actions::Outcome;
 use crate::models::{AiDraft, Briefing, Contact, Person, SuggestedAction, Template, ThreadDetail, ThreadSummary};
 use crate::{edit_text, fmt_date};
 use anyhow::Result;
+mod autocorrect;
 mod claude;
 mod form;
 mod library;
@@ -45,6 +46,8 @@ type PerAccount = Vec<(String, Result<Vec<ThreadSummary>>)>;
 enum Msg {
     Inbox(PerAccount),
     Sent(PerAccount),
+    /// Claude's spelling fixes for the composer text it was given.
+    Corrected { gen: u64, checked: String, fixes: Result<Vec<crate::assistant::Fix>> },
     Searched(String, PerAccount),
     Thread(Result<ThreadDetail>),
     /// Background fetch for the preview pane.
@@ -109,6 +112,27 @@ struct ComposeForm {
     /// Address suggestions for the word being typed in To/Cc/Bcc.
     sugg: Vec<Person>,
     sugg_sel: usize,
+    ac: Autocorrect,
+}
+
+/// Autocorrect state for one message being written.
+#[derive(Default)]
+struct Autocorrect {
+    /// Last keystroke in the body; Claude looks once typing pauses.
+    typed: Option<Instant>,
+    /// The text Claude last looked at (so a pause doesn't re-check the same words).
+    checked: String,
+    /// A check is out; `gen` tells its answer apart from stale ones.
+    busy: bool,
+    gen: u64,
+    /// Body before and after the last correction, for Ctrl+Z.
+    undo: Option<(String, String, Vec<String>)>,
+    /// Fixes the user undid; never made again in this message.
+    rejected: Vec<String>,
+    /// Corrected words, highlighted briefly, and what to say about them.
+    flash: Vec<String>,
+    flash_at: Option<Instant>,
+    note: String,
 }
 
 const FIELD_NAMES: [&str; 5] = ["To", "Cc", "Bcc", "Subject", ""];
@@ -180,6 +204,9 @@ struct App {
     /// Where things were last drawn, for mouse hits.
     hits: Hits,
     claude: ClaudeState,
+    /// Autocorrect while composing (Ctrl+G toggles; `[claude] autocorrect` sets the default).
+    autocorrect_on: bool,
+    ac_gen: u64,
 }
 
 #[derive(Default)]
@@ -231,7 +258,10 @@ pub fn run(engine: Engine) -> Result<()> {
         preview: Preview::default(),
         hits: Hits::default(),
         claude: ClaudeState::default(),
+        autocorrect_on: false,
+        ac_gen: 0,
     };
+    app.autocorrect_on = app.e.cfg.claude.autocorrect;
     app.load_ai();
     app.refresh_engines();
     // Bring back the inboxes shown last time, unless an account was asked for explicitly.
@@ -276,6 +306,7 @@ fn main_loop(term: &mut ratatui::DefaultTerminal, app: &mut App, rx: &Receiver<(
             }
         }
         app.sync_preview();
+        app.sync_autocorrect();
         term.draw(|f| app.draw(f))?;
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
@@ -440,6 +471,7 @@ impl App {
                 self.clamp();
                 self.maybe_auto_brief();
             }
+            Msg::Corrected { gen, checked, fixes } => self.on_corrected(gen, checked, fixes),
             Msg::Sent(per) => {
                 self.sent_loading = false;
                 self.sent_loaded = true;
@@ -1241,6 +1273,15 @@ impl App {
             KeyCode::Char('e') if ctrl => {
                 self.job = Some(EditorJob::Compose { req: req(&form), template: None, from: form.from.clone(), ai_thread: form.ai_thread.clone() });
             }
+            KeyCode::Char('z') if ctrl => {
+                self.undo_correction(&mut form);
+                self.overlay = Overlay::Compose(form);
+            }
+            KeyCode::Char('g') if ctrl => {
+                self.autocorrect_on = !self.autocorrect_on;
+                self.status = if self.autocorrect_on { "✦ Autocorrect on".into() } else { "Autocorrect off".into() };
+                self.overlay = Overlay::Compose(form);
+            }
             // Cycle the sending account (new mail only; replies stay in their thread's account).
             KeyCode::Char('f') if ctrl => {
                 let mut accts: Vec<&String> = self.engines.keys().collect();
@@ -1274,6 +1315,7 @@ impl App {
             KeyCode::Enter => {
                 if form.focus == 4 {
                     form.fields[4].push('\n');
+                    self.typed_in_body(&mut form, '\n');
                 } else {
                     form.focus += 1;
                 }
@@ -1300,8 +1342,16 @@ impl App {
             KeyCode::Backspace => {
                 form.fields[form.focus].pop();
             }
-            KeyCode::Char(c) if !ctrl => form.fields[form.focus].push(c),
+            KeyCode::Char(c) if !ctrl => {
+                form.fields[form.focus].push(c);
+                if form.focus == 4 {
+                    self.typed_in_body(&mut form, c);
+                }
+            }
             _ => {}
+        }
+        if form.focus == 4 {
+            form.ac.typed = Some(Instant::now());
         }
         form.sugg.clear();
         if form.focus < 3 {
@@ -1319,6 +1369,100 @@ impl App {
             }
         }
         self.overlay = Overlay::Compose(form);
+    }
+
+    /// After a character lands in the body: fix a just-finished word from the typo list.
+    fn typed_in_body(&mut self, form: &mut ComposeForm, c: char) {
+        if !self.autocorrect_on || autocorrect::is_word_char(c) {
+            return;
+        }
+        let before = form.fields[4].clone();
+        if let Some((typo, fix)) = autocorrect::fix_last_word(&mut form.fields[4]) {
+            if form.ac.rejected.contains(&typo) {
+                form.fields[4] = before;
+                return;
+            }
+            form.ac.note = format!("{typo} → {fix}");
+            form.ac.undo = Some((before, form.fields[4].clone(), vec![typo]));
+            form.ac.flash = fix.split(' ').map(String::from).collect();
+            form.ac.flash_at = Some(Instant::now());
+        }
+    }
+
+    /// Ask Claude to look over the body once typing has paused.
+    fn sync_autocorrect(&mut self) {
+        if !self.autocorrect_on {
+            return;
+        }
+        let Overlay::Compose(form) = &mut self.overlay else { return };
+        let text = autocorrect::checkable(&form.fields[4]).to_string();
+        let paused = form.ac.typed.is_some_and(|t| t.elapsed().as_millis() >= autocorrect::PAUSE_MS);
+        if form.ac.busy || !paused || text == form.ac.checked || text.split_whitespace().count() < 3 {
+            return;
+        }
+        self.ac_gen += 1;
+        let gen = self.ac_gen;
+        form.ac.busy = true;
+        form.ac.gen = gen;
+        form.ac.checked = text.clone();
+        let from = form.from.clone();
+        let e = self.eng(&from);
+        self.spawn_on(e, move |e| Msg::Corrected { gen, fixes: e.autocorrect(&text), checked: text });
+    }
+
+    fn on_corrected(&mut self, gen: u64, checked: String, fixes: Result<Vec<crate::assistant::Fix>>) {
+        let Overlay::Compose(form) = &mut self.overlay else { return };
+        if form.ac.gen != gen {
+            return;
+        }
+        form.ac.busy = false;
+        let fixes = match fixes {
+            Ok(f) => f,
+            Err(e) => {
+                form.ac.note = format!("autocorrect unavailable: {}", e.to_string().chars().take(60).collect::<String>());
+                form.ac.flash_at = Some(Instant::now());
+                return;
+            }
+        };
+        let body = form.fields[4].clone();
+        let (new, made) = autocorrect::apply(&checked, &body, &fixes, &form.ac.rejected);
+        if made.is_empty() {
+            return;
+        }
+        // Nothing typed since the check: the corrected text counts as checked.
+        if body == checked || autocorrect::checkable(&body) == checked {
+            form.ac.checked = autocorrect::checkable(&new).to_string();
+        }
+        form.ac.note = made.iter().take(3).map(|(a, b)| format!("{a} → {b}")).collect::<Vec<_>>().join(", ");
+        if made.len() > 3 {
+            form.ac.note.push_str(&format!(" +{}", made.len() - 3));
+        }
+        form.ac.flash = made.iter().flat_map(|(_, b)| b.split(' ').map(String::from)).collect();
+        form.ac.flash_at = Some(Instant::now());
+        form.ac.undo = Some((body, new.clone(), made.into_iter().map(|(a, _)| a).collect()));
+        form.fields[4] = new;
+    }
+
+    /// Ctrl+Z: put back what the last correction changed (keeping anything typed since).
+    fn undo_correction(&mut self, form: &mut ComposeForm) {
+        let Some((before, after, typos)) = form.ac.undo.take() else {
+            self.status = "Nothing to undo".into();
+            return;
+        };
+        let body = &form.fields[4];
+        if let Some(rest) = body.strip_prefix(&after) {
+            form.fields[4] = format!("{before}{rest}");
+        } else if body == &after {
+            form.fields[4] = before;
+        } else {
+            self.status = "Text changed since the correction — fix it by hand".into();
+            return;
+        }
+        form.ac.rejected.extend(typos);
+        form.ac.checked = autocorrect::checkable(&form.fields[4]).to_string();
+        form.ac.flash.clear();
+        form.ac.note.clear();
+        self.status = "Undid the correction".into();
     }
 
     /// Address book search as an account (local only, so it's instant).
@@ -1340,6 +1484,16 @@ impl App {
         };
         let hint = if form.sugg.is_empty() { hint } else { " ↑↓ pick · Tab/↵ add · Esc hide · keep typing to narrow " };
         let mut block = self.th.popup(&form.title).title_bottom(Line::from(hint).fg(self.th.muted));
+        let ac = if !self.autocorrect_on {
+            Span::styled(" autocorrect off · Ctrl+G ", Style::new().fg(self.th.muted))
+        } else if form.ac.flash_at.is_some_and(|t| t.elapsed().as_millis() < autocorrect::FLASH_MS * 2) && !form.ac.note.is_empty() {
+            Span::styled(format!(" ✦ {} · Ctrl+Z undo ", form.ac.note), Style::new().fg(self.th.sun))
+        } else if form.ac.busy {
+            Span::styled(" ✦ checking… ", Style::new().fg(self.th.muted))
+        } else {
+            Span::styled(" ✦ autocorrect ", Style::new().fg(self.th.muted))
+        };
+        block = block.title_bottom(Line::from(ac).right_aligned());
         if multi {
             block = block.title(Line::from(format!(" from {} ", form.from)).fg(self.th.accent).right_aligned());
         }
@@ -1364,7 +1518,12 @@ impl App {
             .collect();
         f.render_widget(Paragraph::new(header), hdr);
         f.render_widget(Paragraph::new("─".repeat(sep.width as usize)).fg(self.th.rule), sep);
-        let mut lines: Vec<Line> = form.fields[4].split('\n').map(|l| Line::raw(l.to_string())).collect();
+        let flashing = form.ac.flash_at.is_some_and(|t| t.elapsed().as_millis() < autocorrect::FLASH_MS);
+        let hl = Style::new().fg(self.th.sun).underlined();
+        let mut lines: Vec<Line> = form.fields[4]
+            .split('\n')
+            .map(|l| if flashing { highlight_words(l, &form.ac.flash, hl) } else { Line::raw(l.to_string()) })
+            .collect();
         if form.focus == 4 {
             if let Some(last) = lines.last_mut() {
                 last.spans.push(cursor);
@@ -1899,6 +2058,28 @@ impl App {
     }
 }
 
+
+/// A line with some words picked out (corrected words, briefly).
+fn highlight_words(line: &str, words: &[String], style: Style) -> Line<'static> {
+    let mut spans = vec![];
+    let mut word = String::new();
+    let flush = |word: &mut String, spans: &mut Vec<Span<'static>>| {
+        if !word.is_empty() {
+            let w = std::mem::take(word);
+            spans.push(if words.iter().any(|x| x == &w) { Span::styled(w, style) } else { Span::raw(w) });
+        }
+    };
+    for c in line.chars() {
+        if autocorrect::is_word_char(c) {
+            word.push(c);
+        } else {
+            flush(&mut word, &mut spans);
+            spans.push(Span::raw(c.to_string()));
+        }
+    }
+    flush(&mut word, &mut spans);
+    Line::from(spans)
+}
 
 /// "Jane Doe, sam@x.org" from a To header: names where there are names.
 fn recipients(to: &str) -> String {

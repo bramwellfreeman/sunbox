@@ -41,6 +41,11 @@ sunbox                   # inbox
   your note, `L` has Claude study a sender. It runs on the Claude Code CLI (your plan) or, with
   `ANTHROPIC_API_KEY`, the API. Set `model`, `effort` and an `about` line under `[claude]` in the config.
   CLI: `sunbox claude brief|actions|do|draft|drafts|learn|template|status`.
+- **Autocorrect** while you write: common typos are fixed the moment a word ends (teh → the,
+  dont → don't, i → I), and a second after you pause Claude fixes spelling and capitals (never
+  wording). Fixed words flash; Ctrl+Z undoes the last fix and won't redo it; Ctrl+G turns it off.
+  `[claude] autocorrect = false` turns it off by default; `autocorrect_model` / `autocorrect_effort`
+  (default `low`) tune speed.
 - **Templates** (`t`) and **People** (`P`): edit everything in the app. `w` has Claude write a
   template from a description and `W` revises one, both opening for review. Client profiles grow a
   "learned by Claude" section from your mail, and you can edit it like any other field.

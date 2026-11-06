@@ -61,6 +61,21 @@ pub struct Claude {
     /// A few lines about you and your work, so Claude knows what matters.
     #[serde(default)]
     pub about: String,
+    /// Fix spelling as you type in the composer.
+    #[serde(default = "default_true")]
+    pub autocorrect: bool,
+    /// Model for autocorrect ("" = `model`); a smaller one is quicker.
+    #[serde(default)]
+    pub autocorrect_model: String,
+    #[serde(default = "default_autocorrect_effort")]
+    pub autocorrect_effort: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_autocorrect_effort() -> String {
+    "low".into()
 }
 
 fn default_backend() -> String {
@@ -78,7 +93,8 @@ fn default_command() -> String {
 
 impl Default for Claude {
     fn default() -> Self {
-        Self { backend: default_backend(), model: default_model(), effort: default_effort(), command: default_command(), about: String::new() }
+        Self { backend: default_backend(), model: default_model(), effort: default_effort(), command: default_command(), about: String::new(),
+            autocorrect: true, autocorrect_model: String::new(), autocorrect_effort: default_autocorrect_effort() }
     }
 }
 
