@@ -55,7 +55,9 @@ That's the cheapest way to read a conversation. Replies need only `reply_to_thre
 
 `upsert_contact` merges: only the fields you send change, tags are added, and `fields` keys merge
 (set a key to `""` to delete it). Check `get_contact` before writing to someone and follow their `tone`.
-`suggest_contacts` lists frequent correspondents with no profile yet.
+`suggest_contacts` lists frequent correspondents with no profile yet. `learned` is a running
+summary that Sunbox's built-in Claude assistant keeps up to date (the user can edit it too); read it
+before writing to someone.
 CLI: `sunbox contacts set jane@hall.org --tone "warm" --field instrument=cello` or `--from-json -`.
 
 ## Templates

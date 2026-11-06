@@ -30,6 +30,46 @@ pub struct Config {
     pub agent: Agent,
     #[serde(default)]
     pub mcp: Mcp,
+    #[serde(default)]
+    pub claude: Claude,
+}
+
+/// The built-in assistant (briefings, drafts, client profiles, templates).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Claude {
+    /// "auto" (API when ANTHROPIC_API_KEY is set, else the Claude Code CLI), "cli" or "api".
+    #[serde(default = "default_backend")]
+    pub backend: String,
+    #[serde(default = "default_model")]
+    pub model: String,
+    /// low · medium · high · xhigh · max
+    #[serde(default = "default_effort")]
+    pub effort: String,
+    /// The Claude Code binary for the "cli" backend.
+    #[serde(default = "default_command")]
+    pub command: String,
+    /// A few lines about you and your work, so Claude knows what matters.
+    #[serde(default)]
+    pub about: String,
+}
+
+fn default_backend() -> String {
+    "auto".into()
+}
+fn default_model() -> String {
+    "claude-opus-5-5".into()
+}
+fn default_effort() -> String {
+    "medium".into()
+}
+fn default_command() -> String {
+    "claude".into()
+}
+
+impl Default for Claude {
+    fn default() -> Self {
+        Self { backend: default_backend(), model: default_model(), effort: default_effort(), command: default_command(), about: String::new() }
+    }
 }
 
 /// Remote (HTTP) MCP access for hosted agents.
@@ -106,7 +146,7 @@ impl Config {
             let raw = std::fs::read_to_string(&path)?;
             toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?
         } else {
-            Config { google: Google::default(), agent: Agent::default(), mcp: Mcp::default() }
+            Config { google: Google::default(), agent: Agent::default(), mcp: Mcp::default(), claude: Claude::default() }
         };
         if let Ok(id) = std::env::var("SUNBOX_GOOGLE_CLIENT_ID") {
             cfg.google.client_id = id;

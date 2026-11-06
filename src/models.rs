@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ThreadSummary {
     pub id: String,
     pub subject: String,
@@ -89,6 +89,9 @@ pub struct Contact {
     /// Free-form extra fields, usable in templates as {{contact.<key>}}.
     #[serde(default)]
     pub fields: BTreeMap<String, String>,
+    /// What Claude has learned about them from past mail; editable like any other field.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub learned: String,
     #[serde(default)]
     pub updated_at: String,
 }
@@ -170,4 +173,62 @@ pub struct AuditEntry {
     pub action: String,
     pub detail: String,
     pub ok: bool,
+}
+
+/// Claude's read of the inbox: what matters, what to do, and templates worth having.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Briefing {
+    pub created_at: String,
+    pub accounts: Vec<String>,
+    pub summary: String,
+    pub items: Vec<BriefItem>,
+    #[serde(default)]
+    pub template_ideas: Vec<TemplateIdea>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BriefItem {
+    pub thread_id: String,
+    #[serde(default)]
+    pub account: String,
+    #[serde(default)]
+    pub from: String,
+    #[serde(default)]
+    pub subject: String,
+    /// urgent · high · normal · low
+    pub priority: String,
+    #[serde(default)]
+    pub category: String,
+    pub why: String,
+    /// reply · follow_up · read · archive · none
+    pub action: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TemplateIdea {
+    pub name: String,
+    pub description: String,
+    pub subject: String,
+    pub body: String,
+    pub why: String,
+}
+
+/// A reply Claude wrote, waiting for the user to check it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AiDraft {
+    pub thread_id: String,
+    pub account: String,
+    pub to: String,
+    #[serde(default)]
+    pub cc: String,
+    pub subject: String,
+    pub body: String,
+    /// Things to verify before sending (dates, prices, [[gaps]] Claude couldn't fill).
+    #[serde(default)]
+    pub check: Vec<String>,
+    #[serde(default)]
+    pub template_used: String,
+    pub created_at: String,
+    /// ready · sent · saved · dismissed
+    pub status: String,
 }

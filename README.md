@@ -26,6 +26,18 @@ sunbox                   # inbox
 - **Accounts**: run `sunbox auth login` again to add another Google account. `sunbox auth list` shows them,
   `sunbox auth default <email>` picks the default, and `--account <email>` (or `$SUNBOX_ACCOUNT`) works
   on any command. In the TUI, `a` switches, adds, sets the default or signs out.
+- **Several inboxes at once**: in the TUI press `a`, tick inboxes with space (`A` ticks all) and press ↵.
+  They merge into one list, newest first, with each row tagged by account. Replies and actions go
+  through the right account, and Ctrl+F in the composer picks the sender for new mail.
+- **✦ Claude** (tab 6): Claude reads the inbox, ranks what matters with a one-line reason, and drafts
+  replies to the urgent ones. ↵ opens a draft in the composer to check, edit and send. Nothing is sent
+  without you, and sending is blocked while `[[gaps]]` Claude couldn't fill remain. `w` redrafts with
+  your note, `L` has Claude study a sender. It runs on the Claude Code CLI (your plan) or, with
+  `ANTHROPIC_API_KEY`, the API. Set `model`, `effort` and an `about` line under `[claude]` in the config.
+  CLI: `sunbox claude brief|draft|drafts|learn|template|status`.
+- **Templates** (`t`) and **People** (`P`): edit everything in the app. `w` has Claude write a
+  template from a description and `W` revises one, both opening for review. Client profiles grow a
+  "learned by Claude" section from your mail, and you can edit it like any other field.
 
 ## Where things live
 

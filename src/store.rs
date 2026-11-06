@@ -42,7 +42,8 @@ impl Store {
                  last_date INTEGER NOT NULL, PRIMARY KEY (routine, thread_id));
              CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL,
                  actor TEXT NOT NULL, action TEXT NOT NULL, detail TEXT NOT NULL, ok INTEGER NOT NULL);
-             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS ai (key TEXT PRIMARY KEY, data TEXT NOT NULL);",
         )?;
         Ok(Self { conn: Mutex::new(conn) })
     }
@@ -139,6 +140,24 @@ impl Store {
     }
 
     // ---- generic JSON tables ----
+
+    // ---- assistant results (briefing, drafts) ----
+
+    pub fn ai_put<T: Serialize>(&self, key: &str, v: &T) -> Result<()> {
+        self.put("ai", "key", key, v)
+    }
+
+    pub fn ai_get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
+        self.get("ai", "key", key)
+    }
+
+    /// Everything stored under `prefix`.
+    pub fn ai_list<T: DeserializeOwned>(&self, prefix: &str) -> Result<Vec<T>> {
+        let db = self.db();
+        let mut stmt = db.prepare("SELECT data FROM ai WHERE key LIKE ?1 || '%' ORDER BY key")?;
+        let rows = stmt.query_map([prefix], |r| r.get::<_, String>(0))?;
+        rows.map(|r| Ok(serde_json::from_str(&r?)?)).collect()
+    }
 
     fn put<T: Serialize>(&self, table: &str, key_col: &str, key: &str, v: &T) -> Result<()> {
         self.db().execute(

@@ -1,9 +1,12 @@
 //! Interactive inbox: Tempo-style tabs + list + reader, $EDITOR for writing.
 
 use crate::engine::{Actor, Engine, SendReq};
-use crate::models::{Template, ThreadDetail, ThreadSummary};
+use crate::models::{AiDraft, Briefing, Contact, Template, ThreadDetail, ThreadSummary};
 use crate::{edit_text, fmt_date};
 use anyhow::Result;
+mod claude;
+mod form;
+mod library;
 mod theme;
 
 use crossterm::event::{
@@ -18,9 +21,14 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use claude::ClaudeState;
+use form::Form;
+use library::{LibKind, Library};
 use theme::Theme;
 
-const TABS: [&str; 5] = ["To do", "Primary", "Starred", "Newsletters", "All"];
+const TABS: [&str; 6] = ["To do", "Primary", "Starred", "Newsletters", "All", "✦ Claude"];
+/// The Claude panel's tab.
+const CLAUDE_TAB: usize = 5;
 /// Terminals at least this wide get the list + preview split.
 const SPLIT_MIN_WIDTH: u16 = 120;
 /// How long the selection has to rest before the preview is fetched.
@@ -41,17 +49,38 @@ enum Msg {
     Done { status: Result<String>, reload: bool },
     /// Browser sign-in for another account finished.
     SignedIn(Result<String>),
+    /// Claude finished ranking the inbox.
+    Briefed(Result<Briefing>),
+    /// Claude finished a reply draft for a thread.
+    Drafted(String, Result<AiDraft>),
+    /// Claude updated a client profile.
+    Learned(Result<Contact>),
+    /// Claude wrote a template (unsaved, opens in the editor).
+    AiTemplate(Result<Template>),
+}
+
+impl Msg {
+    /// Results that stay valid when the shown inboxes change.
+    fn outlives_epoch(&self) -> bool {
+        matches!(self, Msg::SignedIn(_) | Msg::Briefed(_) | Msg::Drafted(..) | Msg::Learned(_) | Msg::AiTemplate(_))
+    }
 }
 
 enum View {
     List,
+    /// Templates or people: browse and edit.
+    Library(Library),
     Reader { t: ThreadDetail, scroll: u16, full: bool },
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone)]
 enum InputKind {
     Search,
     Label,
+    /// Redraft a reply with an instruction for Claude.
+    ClaudeNote { thread_id: String, account: String },
+    /// Ask Claude for a new template, or to revise one.
+    TemplateAsk { base: Option<Template> },
 }
 
 /// The in-app compose window.
@@ -63,6 +92,8 @@ struct ComposeForm {
     reply_to: Option<String>,
     /// The account it goes out from.
     from: String,
+    /// Set when this is a Claude draft being checked, so sending marks it done.
+    ai_thread: Option<String>,
     armed_discard: bool,
 }
 
@@ -75,6 +106,8 @@ enum Overlay {
     Templates { items: Vec<Template>, sel: usize, reply_to: Option<String>, from: String },
     Input { kind: InputKind, buf: String },
     Accounts(AccountsList),
+    /// Editing a template or a contact profile.
+    Form(Form),
 }
 
 struct AccountsList {
@@ -89,7 +122,9 @@ struct AccountsList {
 
 /// What needs the real terminal (editor) — handled by the main loop.
 enum EditorJob {
-    Compose { req: SendReq, template: Option<Template>, from: String },
+    Compose { req: SendReq, template: Option<Template>, from: String, ai_thread: Option<String> },
+    /// Edit the focused field of a form.
+    Field(Form),
 }
 
 struct App {
@@ -122,6 +157,7 @@ struct App {
     preview: Preview,
     /// Where things were last drawn, for mouse hits.
     hits: Hits,
+    claude: ClaudeState,
 }
 
 #[derive(Default)]
@@ -169,7 +205,9 @@ pub fn run(engine: Engine) -> Result<()> {
         fetching: HashSet::new(),
         preview: Preview::default(),
         hits: Hits::default(),
+        claude: ClaudeState::default(),
     };
+    app.load_ai();
     app.refresh_engines();
     // Bring back the inboxes shown last time, unless an account was asked for explicitly.
     let saved: Vec<String> = app
@@ -195,7 +233,7 @@ fn main_loop(term: &mut ratatui::DefaultTerminal, app: &mut App, rx: &Receiver<(
     let mut theme_checked = Instant::now();
     while !app.quit {
         while let Ok((epoch, m)) = rx.try_recv() {
-            if epoch == app.epoch || matches!(m, Msg::SignedIn(_)) {
+            if epoch == app.epoch || m.outlives_epoch() {
                 app.on_msg(m);
             }
         }
@@ -219,29 +257,11 @@ fn main_loop(term: &mut ratatui::DefaultTerminal, app: &mut App, rx: &Receiver<(
             std::io::stdout().execute(DisableMouseCapture)?;
             disable_raw_mode()?;
             std::io::stdout().execute(LeaveAlternateScreen)?;
-            let EditorJob::Compose { from, .. } = &job;
-            let from = from.clone();
-            let edited = app.run_editor(job);
+            app.run_job(job);
             std::io::stdout().execute(EnterAlternateScreen)?;
             enable_raw_mode()?;
             std::io::stdout().execute(EnableMouseCapture)?;
             term.clear()?;
-            match edited {
-                Ok(Some(p)) => {
-                    let title = if p.reply_to_thread.is_some() { " Reply " } else { " New message " };
-                    let r = p;
-                    app.overlay = Overlay::Compose(ComposeForm {
-                        title: title.into(),
-                        fields: [r.to, r.cc, r.bcc, r.subject, r.body],
-                        focus: 4,
-                        reply_to: r.reply_to_thread,
-                        from,
-                        armed_discard: false,
-                    });
-                }
-                Ok(None) => app.status = "Discarded empty message".into(),
-                Err(err) => app.status = format!("Error: {err:#}"),
-            }
         }
     }
     Ok(())
@@ -371,6 +391,7 @@ impl App {
                     self.tab = 1;
                 }
                 self.clamp();
+                self.maybe_auto_brief();
             }
             Msg::Searched(q, per) => {
                 self.loading = false;
@@ -414,12 +435,23 @@ impl App {
                     Err(e) => self.status = format!("Error: {e:#}"),
                 }
             }
+            Msg::Briefed(r) => self.on_briefed(r),
+            Msg::Drafted(id, r) => self.on_drafted(id, r),
+            Msg::Learned(r) => self.on_learned(r),
+            Msg::AiTemplate(r) => match r {
+                Ok(t) => {
+                    self.status = "✓ Claude wrote a template — check it, then Ctrl+S to save".into();
+                    self.overlay = Overlay::Form(Form::template(Some(t), None));
+                }
+                Err(e) => self.status = format!("Error: {e:#}"),
+            },
             Msg::Done { status, reload } => {
                 match status {
                     Ok(s) if s.is_empty() => {}
                     Ok(s) => self.status = format!("✓ {s}"),
                     Err(e) => self.status = format!("Error: {e:#}"),
                 }
+                self.load_ai_drafts();
                 if reload {
                     self.reload();
                 }
@@ -438,14 +470,15 @@ impl App {
                 1 => !t.is_bulk,
                 2 => t.starred,
                 3 => t.is_bulk,
-                _ => true,
+                4 => true,
+                _ => false,
             })
             .collect()
     }
 
-    fn counts(&self) -> [usize; 5] {
+    fn counts(&self) -> [usize; 6] {
         let c = |f: fn(&ThreadSummary) -> bool| self.inbox.iter().filter(|t| f(t)).count();
-        [c(|t| t.needs_reply), c(|t| !t.is_bulk), c(|t| t.starred), c(|t| t.is_bulk), self.inbox.len()]
+        [c(|t| t.needs_reply), c(|t| !t.is_bulk), c(|t| t.starred), c(|t| t.is_bulk), self.inbox.len(), self.ready_drafts()]
     }
 
     fn clamp(&mut self) {
@@ -462,6 +495,12 @@ impl App {
                     snippet: String::new(), date: 0, message_count: t.messages.len(), unread: false, starred: false,
                     needs_reply: false, is_bulk: false, labels: vec![], account: t.account.clone(),
                 }));
+        }
+        if matches!(self.view, View::List) && self.tab == CLAUDE_TAB && self.search.is_none() {
+            return self.claude_selected_thread();
+        }
+        if matches!(self.view, View::Library(_)) {
+            return None;
         }
         let v = self.visible();
         self.table.selected().and_then(|i| v.get(i).map(|t| (*t).clone()))
@@ -485,6 +524,9 @@ impl App {
                 match k.code {
                     KeyCode::Esc => {}
                     KeyCode::Enter => self.submit_input(kind, buf),
+                    KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.overlay = Overlay::Input { kind, buf: String::new() };
+                    }
                     KeyCode::Backspace => {
                         buf.pop();
                         self.overlay = Overlay::Input { kind, buf };
@@ -499,6 +541,10 @@ impl App {
             }
             Overlay::Accounts(list) => {
                 self.accounts_key(list, k);
+                return;
+            }
+            Overlay::Form(form) => {
+                self.form_key(form, k);
                 return;
             }
             Overlay::Templates { items, mut sel, reply_to, from } => {
@@ -524,6 +570,14 @@ impl App {
             }
         }
 
+        if let View::Library(_) = self.view {
+            self.library_key(k);
+            return;
+        }
+        if matches!(self.view, View::List) && self.tab == CLAUDE_TAB && self.search.is_none() && self.claude_key(k) {
+            return;
+        }
+
         // Keys shared by list + reader.
         let sel = self.selected();
         match k.code {
@@ -541,6 +595,14 @@ impl App {
             }
             KeyCode::Char('a') => {
                 self.open_accounts();
+                return;
+            }
+            KeyCode::Char('t') if matches!(self.view, View::List) => {
+                self.open_library(LibKind::Templates);
+                return;
+            }
+            KeyCode::Char('P') if matches!(self.view, View::List) => {
+                self.open_library(LibKind::People);
                 return;
             }
             KeyCode::Char('g') => {
@@ -622,6 +684,7 @@ impl App {
                 }
                 _ => {}
             },
+            View::Library(_) => {}
             View::List => match k.code {
                 KeyCode::Char('q') => self.quit = true,
                 KeyCode::Esc => {
@@ -638,7 +701,7 @@ impl App {
                 KeyCode::Home => self.table.select(Some(0)),
                 KeyCode::Tab | KeyCode::Right => self.set_tab((self.tab + 1) % TABS.len()),
                 KeyCode::BackTab | KeyCode::Left => self.set_tab((self.tab + TABS.len() - 1) % TABS.len()),
-                KeyCode::Char(c @ '1'..='5') => self.set_tab(c as usize - '1' as usize),
+                KeyCode::Char(c @ '1'..='6') => self.set_tab(c as usize - '1' as usize),
                 KeyCode::Enter | KeyCode::Char('o') => {
                     if let Some(t) = sel {
                         self.open_thread(t);
@@ -819,7 +882,8 @@ impl App {
             (Overlay::None, _) => {}
             _ => return,
         }
-        let reading = matches!(self.view, View::Reader { .. });
+        // Clicks pick rows only in the mail list; elsewhere right-click goes back.
+        let reading = !matches!(self.view, View::List);
         match m.kind {
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
                 let down = m.kind == MouseEventKind::ScrollDown;
@@ -843,6 +907,10 @@ impl App {
                 }
                 let list = self.hits.list;
                 if !list.contains(at) || self.hits.row_height == 0 {
+                    return;
+                }
+                if self.tab == CLAUDE_TAB && self.search.is_none() {
+                    self.claude_click(m.row - list.y);
                     return;
                 }
                 let i = self.table.offset() + ((m.row - list.y) / self.hits.row_height) as usize;
@@ -873,9 +941,20 @@ impl App {
         self.search = None;
         self.tab = t;
         self.table.select(Some(0));
+        if t == CLAUDE_TAB {
+            self.maybe_auto_brief();
+        }
     }
 
     fn move_sel(&mut self, d: i32) {
+        if let View::Library(lib) = &mut self.view {
+            lib.move_sel(d);
+            return;
+        }
+        if self.tab == CLAUDE_TAB && self.search.is_none() {
+            self.claude_move(d);
+            return;
+        }
         let n = self.visible().len() as i32;
         if n == 0 {
             return;
@@ -895,6 +974,14 @@ impl App {
                 self.status = format!("Searching “{buf}”…");
                 let q = buf.clone();
                 self.spawn_search(buf, 50, move |per| Msg::Searched(q, per));
+            }
+            InputKind::ClaudeNote { thread_id, account } => self.start_draft(thread_id, account, Some(buf)),
+            InputKind::TemplateAsk { base } => {
+                self.status = match &base {
+                    Some(t) => format!("Claude is revising “{}”…", t.name),
+                    None => "Claude is writing a template…".into(),
+                };
+                self.spawn(move |e| Msg::AiTemplate(e.ai_template(&buf, base.as_ref())));
             }
             InputKind::Label => {
                 if let Some(t) = self.selected() {
@@ -945,6 +1032,7 @@ impl App {
                     focus,
                     reply_to: req.reply_to_thread,
                     from,
+                    ai_thread: None,
                     armed_discard: false,
                 });
             }
@@ -973,17 +1061,37 @@ impl App {
                     self.overlay = Overlay::Compose(form);
                     return;
                 }
+                // Claude marks what it couldn't know as [[…]]; never send those by accident.
+                if form.fields[4].contains("[[") && form.fields[4].contains("]]") {
+                    self.status = "Fill in or delete the [[…]] gaps Claude left before sending".into();
+                    self.overlay = Overlay::Compose(form);
+                    return;
+                }
                 self.status = "Sending…".into();
                 let r = req(&form);
-                self.spawn_on(self.eng(&form.from), move |e| Msg::Done { status: e.send(&Actor::User, &r).map(|_| "Sent".into()), reload: true });
+                let ai = form.ai_thread.clone();
+                self.spawn_on(self.eng(&form.from), move |e| {
+                    let sent = e.send(&Actor::User, &r);
+                    if let (Ok(_), Some(t)) = (&sent, &ai) {
+                        let _ = e.set_ai_draft_status(t, "sent");
+                    }
+                    Msg::Done { status: sent.map(|_| "Sent".into()), reload: true }
+                });
             }
             KeyCode::Char('d') if ctrl => {
                 self.status = "Saving draft…".into();
                 let r = req(&form);
-                self.spawn_on(self.eng(&form.from), move |e| Msg::Done { status: e.draft(&Actor::User, &r).map(|_| "Draft saved".into()), reload: false });
+                let ai = form.ai_thread.clone();
+                self.spawn_on(self.eng(&form.from), move |e| {
+                    let saved = e.draft(&Actor::User, &r);
+                    if let (Ok(_), Some(t)) = (&saved, &ai) {
+                        let _ = e.set_ai_draft_status(t, "saved");
+                    }
+                    Msg::Done { status: saved.map(|_| "Draft saved in Gmail".into()), reload: false }
+                });
             }
             KeyCode::Char('e') if ctrl => {
-                self.job = Some(EditorJob::Compose { req: req(&form), template: None, from: form.from.clone() });
+                self.job = Some(EditorJob::Compose { req: req(&form), template: None, from: form.from.clone(), ai_thread: form.ai_thread.clone() });
             }
             // Cycle the sending account (new mail only; replies stay in their thread's account).
             KeyCode::Char('f') if ctrl => {
@@ -1100,12 +1208,38 @@ impl App {
 
     // ---------- editor ----------
 
-    fn run_editor(&mut self, job: EditorJob) -> Result<Option<SendReq>> {
-        let EditorJob::Compose { mut req, template, from } = job;
+    fn run_job(&mut self, job: EditorJob) {
+        match job {
+            EditorJob::Field(mut form) => {
+                if let Err(e) = form.edit_focused_in_editor() {
+                    self.status = format!("Error: {e:#}");
+                }
+                self.overlay = Overlay::Form(form);
+            }
+            EditorJob::Compose { req, template, from, ai_thread } => match self.run_editor(req, template, &from) {
+                Ok(Some(r)) => {
+                    let title = if r.reply_to_thread.is_some() { " Reply " } else { " New message " };
+                    self.overlay = Overlay::Compose(ComposeForm {
+                        title: title.into(),
+                        fields: [r.to, r.cc, r.bcc, r.subject, r.body],
+                        focus: 4,
+                        reply_to: r.reply_to_thread,
+                        from,
+                        ai_thread,
+                        armed_discard: false,
+                    });
+                }
+                Ok(None) => self.status = "Discarded empty message".into(),
+                Err(err) => self.status = format!("Error: {err:#}"),
+            },
+        }
+    }
+
+    fn run_editor(&mut self, mut req: SendReq, template: Option<Template>, from: &str) -> Result<Option<SendReq>> {
         if let Some(t) = &template {
             req.template = Some(t.name.clone());
         }
-        let (to, cc, subject, body) = self.prefill(&req, &from)?;
+        let (to, cc, subject, body) = self.prefill(&req, from)?;
 
         let draft = format!(
             "To: {to}\nCc: {cc}\nBcc: \nSubject: {subject}\n# ── write below; lines starting with # are ignored ──\n{}\n",
@@ -1151,6 +1285,10 @@ impl App {
             Layout::vertical([Constraint::Length(2), Constraint::Fill(1), Constraint::Length(1)]).areas(f.area());
         self.draw_top(f, top);
         match &self.view {
+            View::List if self.tab == CLAUDE_TAB && self.search.is_none() => {
+                self.hits.split = false;
+                self.draw_claude(f, main);
+            }
             View::List => {
                 self.hits.split = main.width >= SPLIT_MIN_WIDTH;
                 if self.hits.split {
@@ -1164,6 +1302,7 @@ impl App {
                 }
             }
             View::Reader { .. } => self.draw_reader(f, main),
+            View::Library(_) => self.draw_library(f, main),
         }
         self.draw_bottom(f, bottom);
         self.draw_overlay(f);
@@ -1381,8 +1520,15 @@ impl App {
         f.render_widget(para.scroll((*scroll, 0)), card);
     }
     fn draw_bottom(&self, f: &mut Frame, area: Rect) {
-        let help = match self.view {
-            View::List => "c compose · ↵ open · r reply · T template · e archive · s star · u read · l label · / search · a accounts · ? help · q quit",
+        let help = match &self.view {
+            View::List if self.tab == CLAUDE_TAB && self.search.is_none() => {
+                "↵ check & send · w redraft with a note · D draft · o open · e archive · x dismiss · L learn sender · R refresh · ? help"
+            }
+            View::Library(l) if l.kind == LibKind::Templates => {
+                "↵ edit · n new · w Claude writes one · W Claude revises · x delete · esc back"
+            }
+            View::Library(_) => "↵ edit · n new · L Claude learns from their mail · x delete · esc back",
+            View::List => "c compose · ↵ open · r reply · T template · e archive · s star · / search · t templates · P people · a inboxes · ? help",
             View::Reader { .. } => "esc back · j/k scroll · r reply · T template · f forward · e archive · s star · l label · p full/clean · ? help",
         };
         let text = if self.status.is_empty() {
@@ -1400,9 +1546,10 @@ impl App {
         match &self.overlay {
             Overlay::None => {}
             Overlay::Compose(form) => self.draw_compose(f, form),
+            Overlay::Form(form) => form.draw(f, &self.th),
             Overlay::Help => {
                 let keys = [
-                    ("Tab / 1-5", "switch tab (To do · Primary · Starred · Newsletters · All)"),
+                    ("Tab / 1-6", "switch tab (To do · Primary · Starred · Newsletters · All · ✦ Claude)"),
                     ("j k ↑ ↓", "move / scroll"),
                     ("↵  o", "open thread"),
                     ("esc", "back / clear search"),
@@ -1419,7 +1566,10 @@ impl App {
                     ("p", "reader: clean ↔ full view"),
                     ("J K", "scroll the preview pane (wide terminals)"),
                     ("mouse", "click to select, double-click to open, wheel scrolls, right-click back"),
-                    ("a", "accounts: switch · add · default · sign out"),
+                    ("a", "inboxes: tick several to show together · add · default · sign out"),
+                    ("6", "✦ Claude: what matters, drafted replies to check & send"),
+                    ("t", "templates: edit yours, or have Claude write one"),
+                    ("P", "people: client profiles Claude learns from your mail"),
                     ("g", "refresh"),
                     ("q", "quit"),
                 ];
@@ -1435,6 +1585,9 @@ impl App {
                 let title = match kind {
                     InputKind::Search => " Search (Gmail syntax: from:, is:unread, newer_than:7d…) ",
                     InputKind::Label => " Add label (created if new) ",
+                    InputKind::ClaudeNote { .. } => " Tell Claude how to reply (e.g. “decline politely, offer next week”) ",
+                    InputKind::TemplateAsk { base: None } => " Describe the template (e.g. “booking confirmation with date, venue and deposit”) ",
+                    InputKind::TemplateAsk { base: Some(_) } => " How should Claude change it? ",
                 };
                 let r = centered(area, 70, 3);
                 f.render_widget(Clear, r);

@@ -1,3 +1,5 @@
+mod ai;
+mod assistant;
 mod cleaning;
 mod config;
 mod engine;
@@ -91,6 +93,9 @@ enum Cmd {
     /// Automations: Gmail query + actions on a schedule.
     #[command(subcommand)]
     Routines(RoutineCmd),
+    /// The built-in Claude assistant: briefings, drafted replies, client profiles, templates.
+    #[command(subcommand)]
+    Claude(ClaudeCmd),
     /// What AI agents may do, and what they did.
     #[command(subcommand)]
     Agent(AgentCmd),
@@ -110,6 +115,36 @@ enum Cmd {
         /// Replace the access token (old one stops working) and exit.
         #[arg(long)]
         rotate_token: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ClaudeCmd {
+    /// Which backend and model the assistant uses.
+    Status,
+    /// Rank what matters in the inbox (--all: every signed-in inbox).
+    Brief {
+        #[arg(long)]
+        all: bool,
+    },
+    /// Draft a reply for you to check (nothing is sent).
+    Draft {
+        thread_id: String,
+        /// Steer the reply, e.g. "decline politely".
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Replies Claude has drafted.
+    Drafts,
+    /// Read recent mail with someone and update their profile.
+    Learn { email: String },
+    /// Write a template from an instruction (--from NAME revises one). Saved only with --save.
+    Template {
+        instruction: String,
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long)]
+        save: bool,
     },
 }
 
@@ -303,6 +338,89 @@ fn print<T: Serialize>(json: bool, v: &T, human: impl FnOnce(&T)) -> Result<()> 
     Ok(())
 }
 
+fn claude_cmd(e: &Engine, json: bool, c: ClaudeCmd) -> Result<()> {
+    match c {
+        ClaudeCmd::Status => {
+            let v = serde_json::json!({"backend": e.claude_backend(), "about": e.cfg.claude.about});
+            print(json, &v, |v| {
+                println!("{}", v["backend"].as_str().unwrap_or_default());
+                if e.cfg.claude.about.is_empty() {
+                    println!("Tip: add a few lines about your work as `about` under [claude] in {}", config::config_path().display());
+                }
+            })?;
+        }
+        ClaudeCmd::Brief { all } => {
+            let accounts = if all { e.accounts()? } else { vec![e.account()?] };
+            let mut threads = vec![];
+            for a in &accounts {
+                threads.extend(e.for_account(a)?.search(&Actor::User, "in:inbox", 60)?);
+            }
+            eprintln!("Asking Claude about {} threads…", threads.len());
+            let b = e.brief(&threads, &accounts)?;
+            print(json, &b, |b| {
+                println!("{}
+", b.summary);
+                for i in &b.items {
+                    println!("{:>7}  {:<9} {} — {}
+         {}", i.priority, i.action, i.from, i.subject, i.why);
+                }
+                for t in &b.template_ideas {
+                    println!("
+Template idea “{}”: {}", t.name, t.why);
+                }
+            })?;
+        }
+        ClaudeCmd::Draft { thread_id, note } => {
+            let d = e.ai_draft(&thread_id, note.as_deref())?;
+            print(json, &d, |d| {
+                println!("To: {}
+Subject: {}
+
+{}", d.to, d.subject, d.body);
+                for c in &d.check {
+                    println!("  ⚠ check: {c}");
+                }
+            })?;
+        }
+        ClaudeCmd::Drafts => {
+            let ds = e.ai_drafts()?;
+            print(json, &ds, |ds| {
+                for d in ds {
+                    println!("{:<10} {}  {} — {}", d.status, d.thread_id, d.to, d.subject);
+                }
+            })?;
+        }
+        ClaudeCmd::Learn { email } => {
+            let c = e.learn_contact(&email)?;
+            print(json, &c, |c| println!("{} <{}> · {}
+
+{}", c.name, c.email, c.relationship, c.learned))?;
+        }
+        ClaudeCmd::Template { instruction, from, save } => {
+            let base = match &from {
+                Some(n) => Some(e.template(&Actor::User, n)?.ok_or_else(|| anyhow!("no template named {n}"))?),
+                None => None,
+            };
+            let mut t = e.ai_template(&instruction, base.as_ref())?;
+            if save {
+                t = e.save_template(&Actor::User, t)?;
+            }
+            print(json, &t, |t| {
+                println!("name: {}
+description: {}
+subject: {}
+
+{}", t.name, t.description, t.subject, t.body);
+                if !save {
+                    println!("
+(not saved — add --save)");
+                }
+            })?;
+        }
+    }
+    Ok(())
+}
+
 fn ok(json: bool, what: &str) {
     if json {
         println!("{}", serde_json::json!({"ok": true}));
@@ -440,6 +558,7 @@ fn run(cli: Cli) -> Result<()> {
             print(json, &labels, |ls| ls.iter().for_each(|l| println!("{}", l.name)))?;
         }
         Cmd::Contacts(c) => contacts_cmd(&e, json, c)?,
+        Cmd::Claude(c) => claude_cmd(&e, json, c)?,
         Cmd::Templates(t) => templates_cmd(&e, json, t)?,
         Cmd::Routines(r) => routines_cmd(&e, json, r)?,
         Cmd::Agent(a) => agent_cmd(e, json, a)?,

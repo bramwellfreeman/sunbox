@@ -183,7 +183,7 @@ impl Engine {
     }
 
     /// Permission check + audit wrapper for anything an actor does.
-    fn act<T>(&self, actor: &Actor, perm: &str, action: &str, detail: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    pub(crate) fn act<T>(&self, actor: &Actor, perm: &str, action: &str, detail: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
         if !matches!(actor, Actor::User) {
             if let Err(e) = self.cfg.require(perm) {
                 self.store.audit(&actor.label(), action, &format!("DENIED {detail}"), false);
@@ -411,6 +411,7 @@ impl Engine {
                 (&mut c.relationship, patch.relationship),
                 (&mut c.tone, patch.tone),
                 (&mut c.notes, patch.notes),
+                (&mut c.learned, patch.learned),
             ] {
                 if !src.is_empty() {
                     *dst = src;
@@ -427,6 +428,19 @@ impl Engine {
                 } else {
                     c.fields.insert(k, v);
                 }
+            }
+            c.updated_at = now();
+            self.store.save_contact(&c)?;
+            Ok(c)
+        })
+    }
+
+    /// Store `c` exactly as given (the profile editor, where clearing a field means clearing it).
+    pub fn replace_contact(&self, actor: &Actor, mut c: Contact) -> Result<Contact> {
+        c.email = c.email.trim().to_lowercase();
+        self.act(actor, "manage", "replace_contact", &c.email.clone(), || {
+            if !c.email.contains('@') {
+                bail!("contact email '{}' is not an address", c.email);
             }
             c.updated_at = now();
             self.store.save_contact(&c)?;
