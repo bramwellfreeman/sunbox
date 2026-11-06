@@ -1,7 +1,7 @@
 //! Interactive inbox: Tempo-style tabs + list + reader, $EDITOR for writing.
 
 use crate::engine::{Actor, Engine, SendReq};
-use crate::models::{AiDraft, Briefing, Contact, Template, ThreadDetail, ThreadSummary};
+use crate::models::{AiDraft, Briefing, Contact, Person, Template, ThreadDetail, ThreadSummary};
 use crate::{edit_text, fmt_date};
 use anyhow::Result;
 mod claude;
@@ -84,6 +84,7 @@ enum InputKind {
 }
 
 /// The in-app compose window.
+#[derive(Default)]
 struct ComposeForm {
     title: String,
     /// to, cc, bcc, subject, body
@@ -95,6 +96,9 @@ struct ComposeForm {
     /// Set when this is a Claude draft being checked, so sending marks it done.
     ai_thread: Option<String>,
     armed_discard: bool,
+    /// Address suggestions for the word being typed in To/Cc/Bcc.
+    sugg: Vec<Person>,
+    sugg_sel: usize,
 }
 
 const FIELD_NAMES: [&str; 5] = ["To", "Cc", "Bcc", "Subject", ""];
@@ -108,6 +112,8 @@ enum Overlay {
     Accounts(AccountsList),
     /// Editing a template or a contact profile.
     Form(Form),
+    /// Contacts search: type to filter, ↵ writes to them.
+    People { query: String, items: Vec<Person>, sel: usize },
 }
 
 struct AccountsList {
@@ -220,6 +226,13 @@ pub fn run(engine: Engine) -> Result<()> {
     let explicit = std::env::var("SUNBOX_ACCOUNT").is_ok() || app.e.default_account().ok().flatten().as_deref() != Some(app.me.as_str());
     let shown = if saved.is_empty() || explicit { vec![app.me.clone()] } else { saved };
     app.set_shown(shown, false);
+    // Keep each account's address book fresh (quietly, in the background).
+    for e in app.engines.values().filter(|e| e.people_stale(12)) {
+        app.spawn_on(e.clone(), |e| {
+            let _ = e.sync_people(&Actor::User);
+            Msg::Done { status: Ok(String::new()), reload: false }
+        });
+    }
 
     let mut term = ratatui::init();
     let _ = std::io::stdout().execute(EnableMouseCapture);
@@ -547,6 +560,31 @@ impl App {
                 self.form_key(form, k);
                 return;
             }
+            Overlay::People { mut query, mut items, mut sel } => {
+                match k.code {
+                    KeyCode::Esc => return,
+                    KeyCode::Enter => {
+                        if let Some(p) = items.get(sel) {
+                            let req = SendReq { to: p.address(), ..Default::default() };
+                            self.open_compose(req, None, self.me.clone());
+                        }
+                        return;
+                    }
+                    KeyCode::Down => sel = (sel + 1).min(items.len().saturating_sub(1)),
+                    KeyCode::Up => sel = sel.saturating_sub(1),
+                    KeyCode::Backspace => {
+                        query.pop();
+                        (items, sel) = (self.people(&self.me, &query, PEOPLE_ROWS), 0);
+                    }
+                    KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
+                        query.push(c);
+                        (items, sel) = (self.people(&self.me, &query, PEOPLE_ROWS), 0);
+                    }
+                    _ => {}
+                }
+                self.overlay = Overlay::People { query, items, sel };
+                return;
+            }
             Overlay::Templates { items, mut sel, reply_to, from } => {
                 match k.code {
                     KeyCode::Esc | KeyCode::Char('q') => {}
@@ -591,6 +629,11 @@ impl App {
             }
             KeyCode::Char('/') => {
                 self.overlay = Overlay::Input { kind: InputKind::Search, buf: String::new() };
+                return;
+            }
+            KeyCode::Char('C') => {
+                let items = self.people(&self.me, "", PEOPLE_ROWS);
+                self.overlay = Overlay::People { query: String::new(), items, sel: 0 };
                 return;
             }
             KeyCode::Char('a') => {
@@ -1034,6 +1077,7 @@ impl App {
                     from,
                     ai_thread: None,
                     armed_discard: false,
+                    ..Default::default()
                 });
             }
             Err(e) => self.status = format!("Error: {e:#}"),
@@ -1043,9 +1087,9 @@ impl App {
     fn compose_key(&mut self, mut form: ComposeForm, k: KeyEvent) {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let req = |f: &ComposeForm| SendReq {
-            to: f.fields[0].trim().to_string(),
-            cc: f.fields[1].trim().to_string(),
-            bcc: f.fields[2].trim().to_string(),
+            to: tidy_addresses(&f.fields[0]),
+            cc: tidy_addresses(&f.fields[1]),
+            bcc: tidy_addresses(&f.fields[2]),
             subject: f.fields[3].trim().to_string(),
             body: f.fields[4].clone(),
             reply_to_thread: f.reply_to.clone(),
@@ -1053,6 +1097,21 @@ impl App {
         };
         if k.code != KeyCode::Esc {
             form.armed_discard = false;
+        }
+        if !form.sugg.is_empty() {
+            match k.code {
+                KeyCode::Down => form.sugg_sel = (form.sugg_sel + 1).min(form.sugg.len() - 1),
+                KeyCode::Up => form.sugg_sel = form.sugg_sel.saturating_sub(1),
+                KeyCode::Tab | KeyCode::Enter => accept_suggestion(&mut form),
+                KeyCode::Esc => form.sugg.clear(),
+                KeyCode::Char(_) | KeyCode::Backspace => return self.compose_edit(form, k),
+                _ => {
+                    form.sugg.clear();
+                    return self.compose_key(form, k);
+                }
+            }
+            self.overlay = Overlay::Compose(form);
+            return;
         }
         match k.code {
             KeyCode::Char('s') if ctrl => {
@@ -1131,26 +1190,51 @@ impl App {
                 }
                 self.overlay = Overlay::Compose(form);
             }
-            KeyCode::Backspace => {
-                if ctrl {
-                    let f = &mut form.fields[form.focus];
-                    while f.ends_with(char::is_whitespace) {
-                        f.pop();
-                    }
-                    while f.chars().last().is_some_and(|c| !c.is_whitespace()) {
-                        f.pop();
-                    }
-                } else {
-                    form.fields[form.focus].pop();
-                }
-                self.overlay = Overlay::Compose(form);
-            }
-            KeyCode::Char(c) if !ctrl => {
-                form.fields[form.focus].push(c);
-                self.overlay = Overlay::Compose(form);
-            }
+            KeyCode::Backspace | KeyCode::Char(_) => self.compose_edit(form, k),
             _ => self.overlay = Overlay::Compose(form),
         }
+    }
+
+    /// Typing / deleting in a compose field; address fields get suggestions.
+    fn compose_edit(&mut self, mut form: ComposeForm, k: KeyEvent) {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        match k.code {
+            KeyCode::Backspace if ctrl => {
+                let f = &mut form.fields[form.focus];
+                while f.ends_with(char::is_whitespace) {
+                    f.pop();
+                }
+                while f.chars().last().is_some_and(|c| !c.is_whitespace()) {
+                    f.pop();
+                }
+            }
+            KeyCode::Backspace => {
+                form.fields[form.focus].pop();
+            }
+            KeyCode::Char(c) if !ctrl => form.fields[form.focus].push(c),
+            _ => {}
+        }
+        form.sugg.clear();
+        if form.focus < 3 {
+            let field = &form.fields[form.focus];
+            let word = current_address(field);
+            if !word.is_empty() && !word.ends_with('>') {
+                let already = field.to_lowercase();
+                form.sugg = self
+                    .people(&form.from, word, 12)
+                    .into_iter()
+                    .filter(|p| !already.contains(&format!("<{}>", p.email)) && !already.split(',').any(|a| a.trim() == p.email))
+                    .take(6)
+                    .collect();
+                form.sugg_sel = 0;
+            }
+        }
+        self.overlay = Overlay::Compose(form);
+    }
+
+    /// Address book search as an account (local only, so it's instant).
+    fn people(&self, account: &str, query: &str, limit: usize) -> Vec<Person> {
+        self.eng(account).find_people(&Actor::User, query, limit).unwrap_or_default()
     }
 
     fn draw_compose(&self, f: &mut Frame, form: &ComposeForm) {
@@ -1165,6 +1249,7 @@ impl App {
         } else {
             " Ctrl+S send · Ctrl+D save draft · Ctrl+E open in $EDITOR · Tab next field · Esc discard "
         };
+        let hint = if form.sugg.is_empty() { hint } else { " ↑↓ pick · Tab/↵ add · Esc hide · keep typing to narrow " };
         let mut block = self.th.popup(&form.title).title_bottom(Line::from(hint).fg(self.th.muted));
         if multi {
             block = block.title(Line::from(format!(" from {} ", form.from)).fg(self.th.accent).right_aligned());
@@ -1204,6 +1289,38 @@ impl App {
         // Keep the cursor (end of body) in view while typing.
         let scroll = if form.focus == 4 { total.saturating_sub(body.height) } else { 0 };
         f.render_widget(para.scroll((scroll, 0)), body);
+
+        if !form.sugg.is_empty() && form.focus < 3 {
+            let x = hdr.x + 10;
+            let w = 72.min(inner.right().saturating_sub(x));
+            let drop = Rect { x, y: hdr.y + form.focus as u16 + 1, width: w, height: form.sugg.len() as u16 + 2 };
+            let drop = drop.intersection(inner);
+            f.render_widget(Clear, drop);
+            f.render_widget(Paragraph::new(self.person_lines(&form.sugg, form.sugg_sel, w)).block(Block::bordered().border_style(Style::new().fg(self.th.rule))), drop);
+        }
+    }
+
+    /// One row per person: ★ for saved profiles, name, address, company.
+    fn person_lines(&self, people: &[Person], sel: usize, width: u16) -> Vec<Line<'static>> {
+        let name_w = (width as usize / 3).clamp(12, 28);
+        people
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let picked = i == sel;
+                let main = if picked { Style::new().fg(self.th.on_chip).bg(self.th.sun) } else { Style::new().fg(self.th.fg) };
+                let dim = if picked { main } else { Style::new().fg(self.th.muted) };
+                let star = Span::styled(if p.profile { "★ " } else { "  " }, if picked { main } else { Style::new().fg(self.th.sun) });
+                let name: String = if p.name.is_empty() { p.email.clone() } else { p.name.clone() };
+                let name: String = name.chars().take(name_w).collect();
+                let extra = if p.company.is_empty() { String::new() } else { format!("  · {}", p.company) };
+                Line::from(vec![
+                    star,
+                    Span::styled(format!("{name:<name_w$}  "), main.bold()),
+                    Span::styled(format!("{}{extra} ", p.email), dim),
+                ])
+            })
+            .collect()
     }
 
     // ---------- editor ----------
@@ -1227,6 +1344,7 @@ impl App {
                         from,
                         ai_thread,
                         armed_discard: false,
+                        ..Default::default()
                     });
                 }
                 Ok(None) => self.status = "Discarded empty message".into(),
@@ -1528,7 +1646,7 @@ impl App {
                 "↵ edit · n new · w Claude writes one · W Claude revises · x delete · esc back"
             }
             View::Library(_) => "↵ edit · n new · L Claude learns from their mail · x delete · esc back",
-            View::List => "c compose · ↵ open · r reply · T template · e archive · s star · / search · t templates · P people · a inboxes · ? help",
+            View::List => "c compose · ↵ open · r reply · T template · e archive · s star · / search · C contacts · t templates · P people · a inboxes · ? help",
             View::Reader { .. } => "esc back · j/k scroll · r reply · T template · f forward · e archive · s star · l label · p full/clean · ? help",
         };
         let text = if self.status.is_empty() {
@@ -1563,6 +1681,7 @@ impl App {
                     ("u", "mark read / unread"),
                     ("l", "add label"),
                     ("/", "search (Gmail syntax)"),
+                    ("C", "contacts: find someone, ↵ to write to them"),
                     ("p", "reader: clean ↔ full view"),
                     ("J K", "scroll the preview pane (wide terminals)"),
                     ("mouse", "click to select, double-click to open, wheel scrolls, right-click back"),
@@ -1617,6 +1736,21 @@ impl App {
                 f.render_widget(Clear, r);
                 f.render_widget(Paragraph::new(lines).block(self.th.popup(" Inboxes — tick the ones to show together ")), r);
             }
+            Overlay::People { query, items, sel } => {
+                let r = centered(area, 88, PEOPLE_ROWS as u16 + 5);
+                let mut lines = vec![
+                    Line::from(vec![Span::styled(" Find  ", Style::new().fg(self.th.sun).bold()), Span::raw(query.clone()), Span::styled("▏", Style::new().fg(self.th.sun))]),
+                    Line::raw(""),
+                ];
+                if items.is_empty() {
+                    let msg = if query.is_empty() { "  Your address book is still filling in from your mail — give it a moment." } else { "  Nobody matches." };
+                    lines.push(Line::from(Span::styled(msg, Style::new().fg(self.th.muted))));
+                }
+                lines.extend(self.person_lines(items, *sel, r.width.saturating_sub(2)));
+                f.render_widget(Clear, r);
+                let block = self.th.popup(" Contacts — type to search · ↑↓ · ↵ write to them · esc close ");
+                f.render_widget(Paragraph::new(lines).block(block), r);
+            }
             Overlay::Templates { items, sel, .. } => {
                 let lines: Vec<Line> = items
                     .iter()
@@ -1649,6 +1783,32 @@ fn account_tag(account: &str, shown: &[String]) -> String {
         mine
     };
     tag.chars().take(10).collect()
+}
+
+const PEOPLE_ROWS: usize = 12;
+
+/// The address being typed: everything after the last comma.
+fn current_address(field: &str) -> &str {
+    field.rsplit(',').next().unwrap_or("").trim_start()
+}
+
+/// Swap the half-typed address for the picked person, ready for the next one.
+fn accept_suggestion(form: &mut ComposeForm) {
+    let Some(p) = form.sugg.get(form.sugg_sel) else { return };
+    let field = &mut form.fields[form.focus];
+    let keep = field.rfind(',').map(|i| i + 1).unwrap_or(0);
+    field.truncate(keep);
+    if keep > 0 {
+        field.push(' ');
+    }
+    field.push_str(&p.address());
+    field.push_str(", ");
+    form.sugg.clear();
+}
+
+/// Trim the trailing ", " a picked suggestion leaves behind.
+fn tidy_addresses(s: &str) -> String {
+    s.trim().trim_end_matches(',').trim_end().to_string()
 }
 
 fn centered(area: Rect, w: u16, h: u16) -> Rect {

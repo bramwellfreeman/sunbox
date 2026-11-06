@@ -212,6 +212,14 @@ struct SendArgs {
 #[derive(Subcommand)]
 enum ContactCmd {
     List { query: Option<String> },
+    /// Search everyone you can write to (saved profiles + people from your mail).
+    Find {
+        query: Vec<String>,
+        #[arg(long, default_value_t = 15)]
+        limit: usize,
+    },
+    /// Rebuild the address book from recent mail (runs by itself on first use).
+    Sync,
     Get { email: String },
     /// Create/update a profile (only given fields change). Or pipe JSON with --from-json -.
     Set {
@@ -695,6 +703,23 @@ fn contacts_cmd(e: &Engine, json: bool, c: ContactCmd) -> Result<()> {
                     println!("{:<34} {:<24} {}", c.email, c.name, extra);
                 }
             })?;
+        }
+        ContactCmd::Find { query, limit } => {
+            e.ensure_people(&me)?;
+            let ps = e.find_people(&me, &query.join(" "), limit)?;
+            print(json, &ps, |ps| {
+                if ps.is_empty() {
+                    println!("Nobody matches. `sunbox contacts sync` rescans your mail.");
+                }
+                for p in ps {
+                    let mark = if p.profile { "★" } else { " " };
+                    println!("{mark} {:<26} {:<36} {}", p.name, p.email, p.company);
+                }
+            })?;
+        }
+        ContactCmd::Sync => {
+            let n = e.sync_people(&me)?;
+            ok(json, &format!("address book: {n} people from recent mail"));
         }
         ContactCmd::Get { email } => {
             let c = e.contact(&me, &email)?.ok_or_else(|| anyhow!("no profile for {email}"))?;
