@@ -144,6 +144,9 @@ pub struct Routine {
     #[serde(default = "default_true")]
     pub enabled: bool,
     pub actions: Vec<RoutineAction>,
+    /// Which signed-in account it watches; the default account when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
     #[serde(default)]
     pub last_run: Option<String>,
 }

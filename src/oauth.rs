@@ -24,7 +24,8 @@ fn random(n: usize) -> String {
 }
 
 /// Runs the browser consent flow and returns the token response.
-pub fn sign_in(cfg: &Config, open_browser: bool) -> Result<TokenResponse> {
+/// `quiet` keeps it off stderr, for callers that own the terminal (the TUI).
+pub fn sign_in(cfg: &Config, open_browser: bool, quiet: bool) -> Result<TokenResponse> {
     if cfg.google.client_secret.is_empty() {
         bail!(
             "no Google client secret configured. Run `crayon auth setup` (or set CRAYON_GOOGLE_CLIENT_SECRET)"
@@ -38,13 +39,15 @@ pub fn sign_in(cfg: &Config, open_browser: bool) -> Result<TokenResponse> {
 
     let url = format!(
         "{AUTH_URL}?client_id={}&redirect_uri={}&response_type=code&scope={}&code_challenge={challenge}\
-         &code_challenge_method=S256&access_type=offline&prompt=consent&state={state}",
+         &code_challenge_method=S256&access_type=offline&prompt=select_account%20consent&state={state}",
         urlencoding::encode(&cfg.google.client_id),
         urlencoding::encode(&redirect),
         urlencoding::encode(SCOPES),
     );
 
-    eprintln!("Open this URL to sign in with Google:\n\n  {url}\n");
+    if !quiet {
+        eprintln!("Open this URL to sign in with Google:\n\n  {url}\n");
+    }
     if open_browser {
         let _ = std::process::Command::new("xdg-open")
             .arg(&url)
@@ -52,7 +55,9 @@ pub fn sign_in(cfg: &Config, open_browser: bool) -> Result<TokenResponse> {
             .stderr(std::process::Stdio::null())
             .spawn();
     }
-    eprintln!("Waiting for Google to redirect back…");
+    if !quiet {
+        eprintln!("Waiting for Google to redirect back…");
+    }
 
     let code = loop {
         let (mut stream, _) = listener.accept()?;

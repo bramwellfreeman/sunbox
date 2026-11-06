@@ -24,6 +24,9 @@ struct Cli {
     /// Machine-readable JSON output (for scripts and agents).
     #[arg(long, global = true)]
     json: bool,
+    /// Act as this signed-in account (default: the default account, or $CRAYON_ACCOUNT).
+    #[arg(long, global = true, value_name = "EMAIL")]
+    account: Option<String>,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -119,14 +122,24 @@ enum AuthCmd {
         #[arg(long)]
         client_secret: Option<String>,
     },
-    /// Sign in with Google in the browser.
+    /// Sign in with Google in the browser. Run again to add another account.
     Login {
         /// Just print the URL (e.g. over SSH).
         #[arg(long)]
         no_browser: bool,
+        /// Make the new account the default.
+        #[arg(long)]
+        default: bool,
     },
-    Logout,
+    /// Sign an account out (the --account one, else the default).
+    Logout {
+        account: Option<String>,
+    },
+    /// Show the signed-in accounts and the default.
+    #[command(alias = "list")]
     Status,
+    /// Choose which account commands, the TUI and agents use by default.
+    Default { account: String },
 }
 
 #[derive(clap::Args)]
@@ -306,7 +319,7 @@ fn run(cli: Cli) -> Result<()> {
         return auth_setup(client_id.clone(), client_secret.clone());
     }
 
-    let e = Engine::open()?;
+    let e = Engine::open(cli.account)?;
     let me = Actor::User;
 
     match cmd {
@@ -327,24 +340,39 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Auth(a) => match a {
             AuthCmd::Setup { .. } => unreachable!(),
-            AuthCmd::Login { no_browser } => {
-                let acct = e.login(!no_browser)?;
-                ok(json, &format!("signed in as {acct}"));
+            AuthCmd::Login { no_browser, default } => {
+                let acct = e.login(!no_browser, false)?;
+                if default || e.accounts()?.len() == 1 {
+                    e.set_default_account(&acct)?;
+                }
+                let is_default = e.default_account()?.as_deref() == Some(acct.as_str());
+                ok(json, &format!("signed in as {acct}{}", if is_default { " (default)" } else { "" }));
             }
-            AuthCmd::Logout => {
-                e.logout()?;
-                ok(json, "signed out (local tokens removed)");
+            AuthCmd::Logout { account } => {
+                let gone = e.logout(account.as_deref())?;
+                ok(json, &format!("signed out {gone} (local tokens removed)"));
+            }
+            AuthCmd::Default { account } => {
+                let acct = e.set_default_account(&account)?;
+                ok(json, &format!("{acct} is now the default account"));
             }
             AuthCmd::Status => {
-                let acct = e.account().ok();
                 let v = serde_json::json!({
-                    "signed_in": acct.is_some(), "account": acct,
+                    "signed_in": !e.accounts()?.is_empty(), "accounts": e.accounts()?,
+                    "default_account": e.default_account()?, "account": e.account().ok(),
                     "client_secret_configured": !e.cfg.google.client_secret.is_empty(),
                     "config": config::config_path(), "data": config::data_dir(),
                 });
                 print(json, &v, |v| {
-                    match v["account"].as_str() {
-                        Some(a) => println!("Signed in as {a}"),
+                    let def = v["default_account"].as_str().unwrap_or_default();
+                    match v["accounts"].as_array().filter(|a| !a.is_empty()) {
+                        Some(accts) => {
+                            println!("Signed in:");
+                            for a in accts.iter().filter_map(|a| a.as_str()) {
+                                println!("  {} {a}", if a == def { "★" } else { " " });
+                            }
+                            println!("  (★ = default; add one with `crayon auth login`)");
+                        }
                         None => println!("Not signed in"),
                     }
                     println!("Client secret: {}", if v["client_secret_configured"] == true { "configured" } else { "MISSING — run `crayon auth setup`" });

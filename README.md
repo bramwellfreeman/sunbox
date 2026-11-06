@@ -23,6 +23,9 @@ crayon                   # inbox
   Add `--json` for machine output.
 - **Agents**: `crayon agent install claude` registers the MCP server. See [AGENTS.md](AGENTS.md).
 - **Routines**: `crayon routines install-timer` adds a systemd user timer that runs due routines.
+- **Accounts**: run `crayon auth login` again to add another Google account. `crayon auth list` shows them,
+  `crayon auth default <email>` picks the default, and `--account <email>` (or `$CRAYON_ACCOUNT`) works
+  on any command. In the TUI, `a` switches, adds, sets the default or signs out.
 
 ## Where things live
 

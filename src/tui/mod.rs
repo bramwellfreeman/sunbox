@@ -34,6 +34,8 @@ enum Msg {
     Preview(String, Result<ThreadDetail>),
     /// An action finished; refresh the inbox afterwards when `reload`.
     Done { status: Result<String>, reload: bool },
+    /// Browser sign-in for another account finished.
+    SignedIn(Result<String>),
 }
 
 enum View {
@@ -65,6 +67,15 @@ enum Overlay {
     Help,
     Templates { items: Vec<Template>, sel: usize, reply_to: Option<String> },
     Input { kind: InputKind, buf: String },
+    Accounts(AccountsList),
+}
+
+struct AccountsList {
+    items: Vec<String>,
+    sel: usize,
+    default: Option<String>,
+    /// First `x` arms, second signs out.
+    armed_remove: bool,
 }
 
 /// What needs the real terminal (editor) — handled by the main loop.
@@ -75,7 +86,11 @@ enum EditorJob {
 struct App {
     e: Arc<Engine>,
     me: String,
-    tx: Sender<Msg>,
+    tx: Sender<(u64, Msg)>,
+    /// Bumped on account switch so replies for the old account are dropped.
+    epoch: u64,
+    /// A browser sign-in is waiting on Google.
+    signing_in: bool,
     inbox: Vec<ThreadSummary>,
     search: Option<(String, Vec<ThreadSummary>)>,
     tab: usize,
@@ -106,6 +121,7 @@ struct Preview {
 struct Hits {
     split: bool,
     tabs: Vec<(u16, u16, usize)>,
+    account: Rect,
     list: Rect,
     row_height: u16,
     preview: Rect,
@@ -120,6 +136,8 @@ pub fn run(engine: Engine) -> Result<()> {
         e,
         me,
         tx,
+        epoch: 0,
+        signing_in: false,
         inbox: vec![],
         search: None,
         tab: 0,
@@ -146,11 +164,13 @@ pub fn run(engine: Engine) -> Result<()> {
     res
 }
 
-fn main_loop(term: &mut ratatui::DefaultTerminal, app: &mut App, rx: &Receiver<Msg>) -> Result<()> {
+fn main_loop(term: &mut ratatui::DefaultTerminal, app: &mut App, rx: &Receiver<(u64, Msg)>) -> Result<()> {
     let mut theme_checked = Instant::now();
     while !app.quit {
-        while let Ok(m) = rx.try_recv() {
-            app.on_msg(m);
+        while let Ok((epoch, m)) = rx.try_recv() {
+            if epoch == app.epoch || matches!(m, Msg::SignedIn(_)) {
+                app.on_msg(m);
+            }
         }
         if theme_checked.elapsed() > Duration::from_secs(2) {
             theme_checked = Instant::now();
@@ -201,8 +221,9 @@ impl App {
     fn spawn(&self, f: impl FnOnce(&Engine) -> Msg + Send + 'static) {
         let e = self.e.clone();
         let tx = self.tx.clone();
+        let epoch = self.epoch;
         std::thread::spawn(move || {
-            let _ = tx.send(f(&e));
+            let _ = tx.send((epoch, f(&e)));
         });
     }
 
@@ -263,6 +284,16 @@ impl App {
                 self.fetching.remove(&id);
                 if let Ok(t) = r {
                     self.cache.insert(id, t);
+                }
+            }
+            Msg::SignedIn(r) => {
+                self.signing_in = false;
+                match r {
+                    Ok(acct) => {
+                        self.switch_account(&acct);
+                        self.status = format!("✓ Signed in as {acct}");
+                    }
+                    Err(e) => self.status = format!("Error: {e:#}"),
                 }
             }
             Msg::Done { status, reload } => {
@@ -348,6 +379,10 @@ impl App {
                 }
                 return;
             }
+            Overlay::Accounts(list) => {
+                self.accounts_key(list, k);
+                return;
+            }
             Overlay::Templates { items, mut sel, reply_to } => {
                 match k.code {
                     KeyCode::Esc | KeyCode::Char('q') => {}
@@ -384,6 +419,10 @@ impl App {
             }
             KeyCode::Char('/') => {
                 self.overlay = Overlay::Input { kind: InputKind::Search, buf: String::new() };
+                return;
+            }
+            KeyCode::Char('a') => {
+                self.open_accounts();
                 return;
             }
             KeyCode::Char('g') => {
@@ -491,6 +530,108 @@ impl App {
         }
     }
 
+    fn open_accounts(&mut self) {
+        match (self.e.accounts(), self.e.default_account()) {
+            (Ok(items), Ok(default)) => {
+                let sel = items.iter().position(|a| a == &self.me).unwrap_or(0);
+                self.overlay = Overlay::Accounts(AccountsList { items, sel, default, armed_remove: false });
+            }
+            (Err(e), _) | (_, Err(e)) => self.status = format!("Error: {e:#}"),
+        }
+    }
+
+    fn accounts_key(&mut self, mut list: AccountsList, k: KeyEvent) {
+        if k.code != KeyCode::Char('x') {
+            list.armed_remove = false;
+        }
+        let picked = list.items.get(list.sel).cloned();
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') => return,
+            KeyCode::Down | KeyCode::Char('j') => list.sel = (list.sel + 1).min(list.items.len().saturating_sub(1)),
+            KeyCode::Up | KeyCode::Char('k') => list.sel = list.sel.saturating_sub(1),
+            KeyCode::Enter => {
+                if let Some(a) = picked {
+                    if a != self.me {
+                        self.switch_account(&a);
+                    }
+                }
+                return;
+            }
+            KeyCode::Char('n') | KeyCode::Char('+') => {
+                if self.signing_in {
+                    self.status = "Already waiting on a sign-in in your browser".into();
+                    return;
+                }
+                self.signing_in = true;
+                self.status = "Finish signing in in your browser — pick the account to add…".into();
+                self.spawn(|e| Msg::SignedIn(e.login(true, true)));
+                return;
+            }
+            KeyCode::Char('*') | KeyCode::Char('d') => {
+                if let Some(a) = picked {
+                    match self.e.set_default_account(&a) {
+                        Ok(a) => {
+                            self.status = format!("✓ {a} is now the default");
+                            list.default = Some(a);
+                        }
+                        Err(e) => self.status = format!("Error: {e:#}"),
+                    }
+                }
+            }
+            KeyCode::Char('x') => {
+                let Some(a) = picked else { return };
+                if !list.armed_remove {
+                    list.armed_remove = true;
+                    self.status = format!("Press x again to sign out {a}");
+                } else {
+                    match self.e.logout(Some(&a)) {
+                        Ok(gone) => {
+                            self.status = format!("✓ Signed out {gone}");
+                            if gone == self.me {
+                                match self.e.default_account() {
+                                    Ok(Some(next)) => self.switch_account(&next),
+                                    _ => {
+                                        self.status = "Signed out of every account — `crayon auth login` to come back".into();
+                                        self.quit = true;
+                                    }
+                                }
+                                return;
+                            }
+                            self.open_accounts();
+                            return;
+                        }
+                        Err(e) => self.status = format!("Error: {e:#}"),
+                    }
+                    list.armed_remove = false;
+                }
+            }
+            _ => {}
+        }
+        self.overlay = Overlay::Accounts(list);
+    }
+
+    /// Point everything at another account and start over on its inbox.
+    fn switch_account(&mut self, account: &str) {
+        match self.e.for_account(account) {
+            Ok(e) => {
+                self.e = Arc::new(e);
+                self.me = account.to_string();
+                self.epoch += 1;
+                self.inbox.clear();
+                self.search = None;
+                self.cache.clear();
+                self.fetching.clear();
+                self.preview = Preview::default();
+                self.view = View::List;
+                self.overlay = Overlay::None;
+                self.table.select(Some(0));
+                self.status = format!("Switched to {account}");
+                self.reload();
+            }
+            Err(e) => self.status = format!("Error: {e:#}"),
+        }
+    }
+
     fn open_thread(&mut self, t: ThreadSummary) {
         let id = t.id.clone();
         if let Some(detail) = self.cache.get(&id) {
@@ -561,6 +702,10 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) if !reading => {
+                if self.hits.account.contains(at) {
+                    self.open_accounts();
+                    return;
+                }
                 if let Some(&(_, _, i)) = self.hits.tabs.iter().find(|(x0, x1, _)| m.row <= 1 && (*x0..*x1).contains(&m.column)) {
                     self.set_tab(i);
                     return;
@@ -901,12 +1046,17 @@ impl App {
                 spans.extend(tab);
             }
         }
-        // The account name gives way to the tabs on narrow terminals.
+        // The account name gives way to the tabs on narrow terminals (`a` still shows it).
         let me = if area.width >= 120 { self.me.as_str() } else { "" };
-        let right = format!("{}{me} ", if self.loading { "⟳ " } else { "" });
-        let [l, r] = Layout::horizontal([Constraint::Fill(1), Constraint::Length(right.chars().count() as u16)]).areas(area);
+        let right = Line::from(vec![
+            Span::styled(if self.loading { "⟳ " } else { "" }, Style::new().fg(self.th.muted)),
+            Span::styled(me, Style::new().fg(self.th.muted)),
+            Span::styled(" ⇄ ", Style::new().fg(self.th.accent)),
+        ]);
+        let [l, r] = Layout::horizontal([Constraint::Fill(1), Constraint::Length(right.width() as u16)]).areas(area);
+        self.hits.account = r;
         f.render_widget(Paragraph::new(Line::from(spans)).block(rule.clone()), l);
-        f.render_widget(Paragraph::new(Span::styled(right, Style::new().fg(self.th.muted))).block(rule), r);
+        f.render_widget(Paragraph::new(right).block(rule), r);
     }
 
     fn draw_list(&mut self, f: &mut Frame, area: Rect) {
@@ -1068,7 +1218,7 @@ impl App {
     }
     fn draw_bottom(&self, f: &mut Frame, area: Rect) {
         let help = match self.view {
-            View::List => "c compose · ↵ open · r reply · T template · e archive · s star · u read · l label · / search · g refresh · ? help · q quit",
+            View::List => "c compose · ↵ open · r reply · T template · e archive · s star · u read · l label · / search · a accounts · ? help · q quit",
             View::Reader { .. } => "esc back · j/k scroll · r reply · T template · f forward · e archive · s star · l label · p full/clean · ? help",
         };
         let text = if self.status.is_empty() {
@@ -1105,6 +1255,7 @@ impl App {
                     ("p", "reader: clean ↔ full view"),
                     ("J K", "scroll the preview pane (wide terminals)"),
                     ("mouse", "click to select, double-click to open, wheel scrolls, right-click back"),
+                    ("a", "accounts: switch · add · default · sign out"),
                     ("g", "refresh"),
                     ("q", "quit"),
                 ];
@@ -1124,6 +1275,29 @@ impl App {
                 let r = centered(area, 70, 3);
                 f.render_widget(Clear, r);
                 f.render_widget(Paragraph::new(format!("{buf}▏")).block(self.th.popup(title)), r);
+            }
+            Overlay::Accounts(list) => {
+                let mut lines: Vec<Line> = list
+                    .items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, a)| {
+                        let style = if i == list.sel { Style::new().fg(self.th.on_chip).bg(self.th.crayon) } else { Style::new().fg(self.th.fg) };
+                        let current = if *a == self.me { Span::styled(" ● ", Style::new().fg(self.th.accent)) } else { Span::raw("   ") };
+                        let default = if list.default.as_deref() == Some(a.as_str()) { Span::styled("  default", Style::new().fg(self.th.muted)) } else { Span::raw("") };
+                        Line::from(vec![current, Span::styled(format!(" {:<40} ", a), style), default])
+                    })
+                    .collect();
+                lines.push(Line::raw(""));
+                let hint = if self.signing_in {
+                    "  waiting on your browser…".to_string()
+                } else {
+                    "  ↵ switch · n add account · d make default · x sign out".to_string()
+                };
+                lines.push(Line::from(Span::styled(hint, Style::new().fg(self.th.muted))));
+                let r = centered(area, 64, lines.len() as u16 + 2);
+                f.render_widget(Clear, r);
+                f.render_widget(Paragraph::new(lines).block(self.th.popup(" Accounts — ● current ")), r);
             }
             Overlay::Templates { items, sel, .. } => {
                 let lines: Vec<Line> = items

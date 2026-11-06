@@ -83,18 +83,27 @@ pub struct RoutineReport {
 pub struct Engine {
     pub cfg: Config,
     pub store: Store,
+    /// The account this engine works as; `None` follows the default account.
+    acct: Option<String>,
     token: Mutex<Option<(String, i64)>>,
 }
 
 impl Engine {
-    pub fn open() -> Result<Self> {
-        Ok(Self { cfg: Config::load()?, store: Store::open()?, token: Mutex::new(None) })
+    /// Works as `account`, else `$CRAYON_ACCOUNT`, else the default account.
+    pub fn open(account: Option<String>) -> Result<Self> {
+        let acct = account.or_else(|| std::env::var("CRAYON_ACCOUNT").ok()).filter(|a| !a.trim().is_empty());
+        Ok(Self { cfg: Config::load()?, store: Store::open()?, acct, token: Mutex::new(None) })
+    }
+
+    /// Another engine on the same config and data, working as `account`.
+    pub fn for_account(&self, account: &str) -> Result<Engine> {
+        Ok(Self { cfg: self.cfg.clone(), store: Store::open()?, acct: Some(account.to_string()), token: Mutex::new(None) })
     }
 
     // ---------- auth ----------
 
-    pub fn login(&self, open_browser: bool) -> Result<String> {
-        let tok = oauth::sign_in(&self.cfg, open_browser)?;
+    pub fn login(&self, open_browser: bool, quiet: bool) -> Result<String> {
+        let tok = oauth::sign_in(&self.cfg, open_browser, quiet)?;
         let refresh = tok
             .refresh_token
             .ok_or_else(|| anyhow!("Google returned no refresh token; revoke access and retry"))?;
@@ -106,19 +115,42 @@ impl Engine {
             access_token: tok.access_token.clone(),
             expires_at,
         })?;
-        *self.token.lock().unwrap() = Some((tok.access_token, expires_at));
+        // The cached token belongs to whichever account this engine was working as.
+        *self.token.lock().unwrap() = None;
         self.store.audit("user", "login", &account, true);
         Ok(account)
     }
 
-    pub fn logout(&self) -> Result<()> {
-        self.store.clear_tokens()?;
+    /// Signs `account` (or this engine's account) out and returns which one it was.
+    pub fn logout(&self, account: Option<&str>) -> Result<String> {
+        let account = match account {
+            Some(a) => a.to_string(),
+            None => self.account()?,
+        };
+        if !self.store.remove_tokens(&account)? {
+            bail!("{account} isn't signed in");
+        }
         *self.token.lock().unwrap() = None;
-        Ok(())
+        self.store.audit("user", "logout", &account, true);
+        Ok(account)
     }
 
     pub fn account(&self) -> Result<String> {
-        Ok(self.store.tokens()?.ok_or_else(not_signed_in)?.account)
+        Ok(self.store.tokens(self.acct.as_deref())?.ok_or_else(|| not_signed_in(self.acct.as_deref()))?.account)
+    }
+
+    pub fn accounts(&self) -> Result<Vec<String>> {
+        self.store.accounts()
+    }
+
+    pub fn default_account(&self) -> Result<Option<String>> {
+        self.store.default_account()
+    }
+
+    pub fn set_default_account(&self, account: &str) -> Result<String> {
+        let found = self.store.tokens(Some(account))?.ok_or_else(|| not_signed_in(Some(account)))?;
+        self.store.set_default_account(&found.account)?;
+        Ok(found.account)
     }
 
     fn gmail(&self) -> Result<Gmail> {
@@ -129,14 +161,14 @@ impl Engine {
                 return Ok(Gmail::new(tok.clone()));
             }
         }
-        let stored = self.store.tokens()?.ok_or_else(not_signed_in)?;
+        let stored = self.store.tokens(self.acct.as_deref())?.ok_or_else(|| not_signed_in(self.acct.as_deref()))?;
         if stored.expires_at - 60 > now && !stored.access_token.is_empty() {
             *cached = Some((stored.access_token.clone(), stored.expires_at));
             return Ok(Gmail::new(stored.access_token));
         }
         let fresh = oauth::refresh(&self.cfg, &stored.refresh_token)?;
         let exp = now + fresh.expires_in;
-        self.store.update_access(&fresh.access_token, exp)?;
+        self.store.update_access(&stored.account, &fresh.access_token, exp)?;
         *cached = Some((fresh.access_token.clone(), exp));
         Ok(Gmail::new(fresh.access_token))
     }
@@ -444,6 +476,9 @@ impl Engine {
             if r.name.trim().is_empty() || r.query.trim().is_empty() || r.actions.is_empty() {
                 bail!("a routine needs a name, a Gmail query and at least one action");
             }
+            if let Some(a) = &r.account {
+                r.account = Some(self.store.tokens(Some(a))?.ok_or_else(|| not_signed_in(Some(a)))?.account);
+            }
             for a in &r.actions {
                 match a {
                     RoutineAction::Draft { template, .. } | RoutineAction::Send { template, .. } => {
@@ -492,7 +527,23 @@ impl Engine {
                 continue;
             }
             let actor = Actor::Routine(r.name.clone());
-            let threads = self.search(&actor, &r.query, 25)?;
+            // A routine tied to another account runs as that account.
+            let other;
+            let eng = match &r.account {
+                Some(a) if self.account().map_or(true, |me| !me.eq_ignore_ascii_case(a)) => {
+                    other = self.for_account(a)?;
+                    &other
+                }
+                _ => self,
+            };
+            let threads = match eng.search(&actor, &r.query, 25) {
+                Ok(ts) => ts,
+                Err(e) => {
+                    rep.skipped = Some(format!("error: {e:#}"));
+                    reports.push(rep);
+                    continue;
+                }
+            };
             for t in threads {
                 if self.store.routine_seen(&r.name, &t.id)?.is_some_and(|d| d >= t.date) {
                     continue;
@@ -503,7 +554,7 @@ impl Engine {
                     continue;
                 }
                 for action in &r.actions {
-                    let res = self.run_action(&actor, action, &t);
+                    let res = eng.run_action(&actor, action, &t);
                     rep.results.push(match res {
                         Ok(msg) => format!("{}: {msg}", t.id),
                         Err(e) => format!("{}: ERROR {e}", t.id),
@@ -575,6 +626,9 @@ impl Engine {
     }
 }
 
-fn not_signed_in() -> anyhow::Error {
-    anyhow!("not signed in — run `crayon auth login`")
+fn not_signed_in(account: Option<&str>) -> anyhow::Error {
+    match account {
+        Some(a) => anyhow!("{a} isn't signed in — run `crayon auth login` and pick it, or see `crayon auth list`"),
+        None => anyhow!("not signed in — run `crayon auth login`"),
+    }
 }

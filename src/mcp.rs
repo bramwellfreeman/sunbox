@@ -60,9 +60,13 @@ fn tools() -> Value {
         },
         "required": ["type"]
     });
-    let t = |name: &str, desc: &str, schema: Value| json!({"name": name, "description": desc, "inputSchema": schema});
+    let t = |name: &str, desc: &str, mut schema: Value| {
+        // Every tool can act as any signed-in account.
+        schema["properties"]["account"] = json!({"type": "string", "description": "Signed-in account (email) to act as; the default account when omitted. `whoami` lists them."});
+        json!({"name": name, "description": desc, "inputSchema": schema})
+    };
     json!([
-        t("whoami", "Signed-in account and the permissions agents currently hold.", obj(json!({}), &[])),
+        t("whoami", "Signed-in accounts (and the default), plus the permissions agents currently hold.", obj(json!({}), &[])),
         t("inbox_triage", "Inbox overview: threads needing a reply, threads waiting on others, and bulk/newsletters.",
           obj(json!({"max": {"type": "integer", "default": 40}}), &[])),
         t("search_threads", "Search mail with Gmail query syntax (e.g. 'from:x is:unread newer_than:7d'). Defaults to the inbox.",
@@ -122,6 +126,8 @@ fn call(e: &Engine, actor: &Actor, name: &str, a: &Value) -> Result<Value> {
     Ok(match name {
         "whoami" => json!({
             "account": e.account()?,
+            "accounts": e.accounts()?,
+            "default_account": e.default_account()?,
             "agent_permissions": e.cfg.agent.allow,
             "all_permissions": PERMISSIONS.iter().map(|(p, d)| json!({"name": p, "meaning": d})).collect::<Vec<_>>(),
         }),
@@ -239,7 +245,16 @@ pub fn handle(engine: &Engine, actor: &mut Actor, msg: &Value, rename: bool) -> 
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or_default();
             let args = if params["arguments"].is_object() { params["arguments"].clone() } else { json!({}) };
-            Ok(match call(engine, actor, name, &args) {
+            let other = match args["account"].as_str().filter(|a| !a.is_empty()) {
+                Some(a) => Some(engine.for_account(a)),
+                None => None,
+            };
+            let res = match other {
+                Some(Ok(e)) => call(&e, actor, name, &args),
+                Some(Err(e)) => Err(e),
+                None => call(engine, actor, name, &args),
+            };
+            Ok(match res {
                 Ok(v) => json!({"content": [{"type": "text", "text": serde_json::to_string_pretty(&v).unwrap_or_default()}]}),
                 Err(e) => json!({"content": [{"type": "text", "text": format!("Error: {e:#}")}], "isError": true}),
             })

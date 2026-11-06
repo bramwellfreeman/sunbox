@@ -7,6 +7,13 @@ Crayon Box is the user's Gmail plus a local store of **contact profiles**, **tem
   (or `codex`), or point any MCP client at `crayon mcp`.
 - **CLI**: every command takes `--json`. `crayon --help`, `crayon <cmd> --help`.
 
+## Accounts
+
+Several Google accounts can be signed in. Every MCP tool takes an optional `account` (an email);
+without it you act as the default account. `whoami` lists `accounts` and `default_account`.
+CLI: `--account <email>` on any command. Contacts and templates are shared across accounts; a
+routine can set `"account"` to watch a specific one.
+
 ## Permissions
 
 The user decides what agents may do (`crayon agent permissions`):

@@ -41,7 +41,8 @@ impl Store {
              CREATE TABLE IF NOT EXISTS routine_seen (routine TEXT NOT NULL, thread_id TEXT NOT NULL,
                  last_date INTEGER NOT NULL, PRIMARY KEY (routine, thread_id));
              CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL,
-                 actor TEXT NOT NULL, action TEXT NOT NULL, detail TEXT NOT NULL, ok INTEGER NOT NULL);",
+                 actor TEXT NOT NULL, action TEXT NOT NULL, detail TEXT NOT NULL, ok INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
         )?;
         Ok(Self { conn: Mutex::new(conn) })
     }
@@ -52,12 +53,20 @@ impl Store {
 
     // ---- tokens ----
 
-    pub fn tokens(&self) -> Result<Option<Tokens>> {
+    /// Tokens for `account`, or for the default account when `None`.
+    pub fn tokens(&self, account: Option<&str>) -> Result<Option<Tokens>> {
+        let account = match account {
+            Some(a) => a.to_string(),
+            None => match self.default_account()? {
+                Some(a) => a,
+                None => return Ok(None),
+            },
+        };
         Ok(self
             .db()
             .query_row(
-                "SELECT account, refresh_token, access_token, expires_at FROM tokens LIMIT 1",
-                [],
+                "SELECT account, refresh_token, access_token, expires_at FROM tokens WHERE account = ?1 COLLATE NOCASE",
+                [&account],
                 |r| {
                     Ok(Tokens {
                         account: r.get(0)?,
@@ -70,26 +79,62 @@ impl Store {
             .optional()?)
     }
 
-    pub fn save_tokens(&self, t: &Tokens) -> Result<()> {
+    /// Signed-in accounts, oldest first.
+    pub fn accounts(&self) -> Result<Vec<String>> {
         let db = self.db();
-        db.execute("DELETE FROM tokens", [])?;
-        db.execute(
-            "INSERT INTO tokens VALUES (?1, ?2, ?3, ?4)",
+        let mut stmt = db.prepare("SELECT account FROM tokens ORDER BY rowid")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The chosen default, falling back to the first account signed in.
+    pub fn default_account(&self) -> Result<Option<String>> {
+        let accounts = self.accounts()?;
+        let chosen = self.setting("default_account")?;
+        Ok(chosen
+            .and_then(|c| accounts.iter().find(|a| a.eq_ignore_ascii_case(&c)).cloned())
+            .or_else(|| accounts.into_iter().next()))
+    }
+
+    pub fn set_default_account(&self, account: &str) -> Result<()> {
+        self.set_setting("default_account", account)
+    }
+
+    /// Adds the account, or replaces its tokens if it's already signed in.
+    pub fn save_tokens(&self, t: &Tokens) -> Result<()> {
+        self.db().execute(
+            "INSERT INTO tokens VALUES (?1, ?2, ?3, ?4) ON CONFLICT(account) DO UPDATE SET
+                 refresh_token = excluded.refresh_token, access_token = excluded.access_token,
+                 expires_at = excluded.expires_at",
             params![t.account, t.refresh_token, t.access_token, t.expires_at],
         )?;
         Ok(())
     }
 
-    pub fn update_access(&self, access: &str, expires_at: i64) -> Result<()> {
+    pub fn update_access(&self, account: &str, access: &str, expires_at: i64) -> Result<()> {
         self.db().execute(
-            "UPDATE tokens SET access_token = ?1, expires_at = ?2",
-            params![access, expires_at],
+            "UPDATE tokens SET access_token = ?2, expires_at = ?3 WHERE account = ?1",
+            params![account, access, expires_at],
         )?;
         Ok(())
     }
 
-    pub fn clear_tokens(&self) -> Result<()> {
-        self.db().execute("DELETE FROM tokens", [])?;
+    /// Returns false when that account wasn't signed in.
+    pub fn remove_tokens(&self, account: &str) -> Result<bool> {
+        Ok(self.db().execute("DELETE FROM tokens WHERE account = ?1 COLLATE NOCASE", [account])? > 0)
+    }
+
+    // ---- settings ----
+
+    fn setting(&self, key: &str) -> Result<Option<String>> {
+        Ok(self.db().query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| r.get(0)).optional()?)
+    }
+
+    fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.db().execute(
+            "INSERT INTO settings VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
         Ok(())
     }
 
