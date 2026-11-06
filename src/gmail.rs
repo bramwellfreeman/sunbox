@@ -178,11 +178,11 @@ impl Gmail {
 fn check(resp: Result<ureq::Response, ureq::Error>) -> Result<Value> {
     match resp {
         Ok(r) => Ok(r.into_json()?),
-        Err(ureq::Error::Status(401, _)) => bail!("Gmail rejected the token (401) — run `crayon auth login`"),
+        Err(ureq::Error::Status(401, _)) => bail!("Gmail rejected the token (401) — run `sunbox auth login`"),
         Err(ureq::Error::Status(403, r)) => {
             let body = r.into_string().unwrap_or_default();
             if body.contains("insufficient") || body.contains("SCOPE") {
-                bail!("Gmail permission missing — run `crayon auth login` to re-consent");
+                bail!("Gmail permission missing — run `sunbox auth login` to re-consent");
             }
             bail!("Gmail HTTP 403: {body}")
         }

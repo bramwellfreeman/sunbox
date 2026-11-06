@@ -17,14 +17,14 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Read, Write};
 
-/// Crayon Box Email — Gmail in your terminal, built for humans and AI agents.
+/// Sunbox — Gmail in your terminal, built for humans and AI agents.
 #[derive(Parser)]
-#[command(name = "crayon", version, about)]
+#[command(name = "sunbox", version, about)]
 struct Cli {
     /// Machine-readable JSON output (for scripts and agents).
     #[arg(long, global = true)]
     json: bool,
-    /// Act as this signed-in account (default: the default account, or $CRAYON_ACCOUNT).
+    /// Act as this signed-in account (default: the default account, or $SUNBOX_ACCOUNT).
     #[arg(long, global = true, value_name = "EMAIL")]
     account: Option<String>,
     #[command(subcommand)]
@@ -61,7 +61,7 @@ enum Cmd {
     Send(SendArgs),
     /// Remove a thread from the inbox.
     Archive { thread_id: String },
-    /// Star a thread (Crayon's "To do"); --off to unstar.
+    /// Star a thread (Sunbox's "To do"); --off to unstar.
     Star {
         thread_id: String,
         #[arg(long)]
@@ -287,8 +287,9 @@ fn parse_kv(s: &str) -> Result<(String, String), String> {
 
 fn main() {
     let cli = Cli::parse();
+    config::migrate_from_crayon();
     if let Err(e) = run(cli) {
-        eprintln!("crayon: {e:#}");
+        eprintln!("sunbox: {e:#}");
         std::process::exit(1);
     }
 }
@@ -328,7 +329,7 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Mcp { bind, name, show_token, rotate_token, .. } => {
             let mut cfg = e.cfg.clone();
             if cfg.mcp.http_token.is_empty() || rotate_token {
-                cfg.mcp.http_token = format!("crayon_{}", mcp::rand_hex(24));
+                cfg.mcp.http_token = format!("sunbox_{}", mcp::rand_hex(24));
                 cfg.save()?;
                 e.store.audit("user", "mcp_token", if rotate_token { "rotated" } else { "created" }, true);
             }
@@ -371,11 +372,11 @@ fn run(cli: Cli) -> Result<()> {
                             for a in accts.iter().filter_map(|a| a.as_str()) {
                                 println!("  {} {a}", if a == def { "★" } else { " " });
                             }
-                            println!("  (★ = default; add one with `crayon auth login`)");
+                            println!("  (★ = default; add one with `sunbox auth login`)");
                         }
                         None => println!("Not signed in"),
                     }
-                    println!("Client secret: {}", if v["client_secret_configured"] == true { "configured" } else { "MISSING — run `crayon auth setup`" });
+                    println!("Client secret: {}", if v["client_secret_configured"] == true { "configured" } else { "MISSING — run `sunbox auth setup`" });
                     println!("Config: {}\nData:   {}", v["config"].as_str().unwrap_or(""), v["data"].as_str().unwrap_or(""));
                 })?;
             }
@@ -467,7 +468,7 @@ fn auth_setup(id: Option<String>, secret: Option<String>) -> Result<()> {
     }
     cfg.google.client_secret = secret;
     cfg.save()?;
-    println!("✓ saved to {} — now run `crayon auth login`", config::config_path().display());
+    println!("✓ saved to {} — now run `sunbox auth login`", config::config_path().display());
     Ok(())
 }
 
@@ -483,7 +484,7 @@ fn read_input(arg: &str) -> Result<String> {
 
 /// Open $EDITOR on `initial` and return what was saved.
 pub fn edit_text(initial: &str) -> Result<String> {
-    let path = std::env::temp_dir().join(format!("crayon-{}.txt", std::process::id()));
+    let path = std::env::temp_dir().join(format!("sunbox-{}.txt", std::process::id()));
     std::fs::write(&path, initial)?;
     let editor = std::env::var("VISUAL").or_else(|_| std::env::var("EDITOR")).unwrap_or_else(|_| "nvim".into());
     let status = std::process::Command::new("sh")
@@ -563,7 +564,7 @@ fn contacts_cmd(e: &Engine, json: bool, c: ContactCmd) -> Result<()> {
             let cs = e.contacts(&me, query.as_deref())?;
             print(json, &cs, |cs| {
                 if cs.is_empty() {
-                    println!("No contact profiles yet. Try `crayon contacts suggest`.");
+                    println!("No contact profiles yet. Try `sunbox contacts suggest`.");
                 }
                 for c in cs {
                     let extra = [c.company.as_str(), c.relationship.as_str()]
@@ -627,7 +628,7 @@ fn templates_cmd(e: &Engine, json: bool, t: TemplateCmd) -> Result<()> {
             let ts = e.templates(&me)?;
             print(json, &ts, |ts| {
                 if ts.is_empty() {
-                    println!("No templates yet. `crayon templates set <name>` opens your editor.");
+                    println!("No templates yet. `sunbox templates set <name>` opens your editor.");
                 }
                 for t in ts {
                     println!("{:<24} {}", t.name, if t.description.is_empty() { &t.subject } else { &t.description });
@@ -751,26 +752,26 @@ fn install_timer(every: u32) -> Result<()> {
     let dir = dirs::config_dir().ok_or_else(|| anyhow!("no config dir"))?.join("systemd/user");
     std::fs::create_dir_all(&dir)?;
     std::fs::write(
-        dir.join("crayon-routines.service"),
+        dir.join("sunbox-routines.service"),
         format!(
-            "[Unit]\nDescription=Crayon Box routines\n\n[Service]\nType=oneshot\nExecStart={} routines tick\n",
+            "[Unit]\nDescription=Sunbox routines\n\n[Service]\nType=oneshot\nExecStart={} routines tick\n",
             exe.display()
         ),
     )?;
     std::fs::write(
-        dir.join("crayon-routines.timer"),
+        dir.join("sunbox-routines.timer"),
         format!(
-            "[Unit]\nDescription=Tick Crayon Box routines every {every} min\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec={every}min\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n"
+            "[Unit]\nDescription=Tick Sunbox routines every {every} min\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec={every}min\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n"
         ),
     )?;
     let st = std::process::Command::new("systemctl")
         .args(["--user", "daemon-reload"])
         .status()
-        .and_then(|_| std::process::Command::new("systemctl").args(["--user", "enable", "--now", "crayon-routines.timer"]).status())?;
+        .and_then(|_| std::process::Command::new("systemctl").args(["--user", "enable", "--now", "sunbox-routines.timer"]).status())?;
     if !st.success() {
         bail!("systemctl failed ({st})");
     }
-    println!("✓ crayon-routines.timer active (every {every} min). Logs: journalctl --user -u crayon-routines");
+    println!("✓ sunbox-routines.timer active (every {every} min). Logs: journalctl --user -u sunbox-routines");
     Ok(())
 }
 
@@ -820,15 +821,15 @@ fn agent_cmd(mut e: Engine, json: bool, a: AgentCmd) -> Result<()> {
         AgentCmd::Install { client } => {
             let exe = std::env::current_exe()?.display().to_string();
             let args: Vec<&str> = match client.as_str() {
-                "claude" => vec!["mcp", "add", "-s", "user", "crayon", "--", &exe, "mcp"],
-                "codex" => vec!["mcp", "add", "crayon", "--", &exe, "mcp"],
+                "claude" => vec!["mcp", "add", "-s", "user", "sunbox", "--", &exe, "mcp"],
+                "codex" => vec!["mcp", "add", "sunbox", "--", &exe, "mcp"],
                 other => bail!("don't know how to register with '{other}'. Point it at: {exe} mcp"),
             };
             let st = std::process::Command::new(&client).args(&args).status().with_context(|| format!("running {client}"))?;
             if !st.success() {
                 bail!("{client} mcp add failed ({st})");
             }
-            ok(json, &format!("registered Crayon Box MCP server with {client}"));
+            ok(json, &format!("registered Sunbox MCP server with {client}"));
         }
     }
     Ok(())

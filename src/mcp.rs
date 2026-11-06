@@ -1,5 +1,5 @@
 //! MCP server over stdio (newline-delimited JSON-RPC 2.0).
-//! `crayon mcp` — register with e.g. `claude mcp add crayon -- crayon mcp`.
+//! `sunbox mcp` — register with e.g. `claude mcp add sunbox -- sunbox mcp`.
 
 use crate::config::PERMISSIONS;
 use crate::engine::{Actor, Engine, SendReq};
@@ -8,7 +8,7 @@ use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use std::io::{BufRead, Read, Write};
 
-const INSTRUCTIONS: &str = "Crayon Box gives you the user's Gmail plus a local store of contact profiles, \
+const INSTRUCTIONS: &str = "Sunbox gives you the user's Gmail plus a local store of contact profiles, \
 reply templates and routines. Start with `inbox_triage` for an overview, read threads with `get_thread` \
 (the `transcript` field is the compact LLM-friendly view), and check `get_contact` before writing to someone — \
 profiles carry tone and notes. Prefer `create_draft` unless the user asked you to send. Templates use \
@@ -236,7 +236,7 @@ pub fn handle(engine: &Engine, actor: &mut Actor, msg: &Value, rename: bool) -> 
             Ok(json!({
                 "protocolVersion": params["protocolVersion"].as_str().unwrap_or("2025-06-18"),
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "crayon-box", "version": env!("CARGO_PKG_VERSION")},
+                "serverInfo": {"name": "sunbox", "version": env!("CARGO_PKG_VERSION")},
                 "instructions": INSTRUCTIONS,
             }))
         }
@@ -299,7 +299,7 @@ fn same(a: &str, b: &str) -> bool {
 pub fn serve_http(engine: &Engine, bind: &str, token: &str, agent: &str) -> Result<()> {
     use tiny_http::{Header, Response, Server};
     let server = Server::http(bind).map_err(|e| anyhow!("binding {bind}: {e}"))?;
-    eprintln!("Crayon MCP (HTTP) listening on http://{bind}/mcp as agent '{agent}'");
+    eprintln!("Sunbox MCP (HTTP) listening on http://{bind}/mcp as agent '{agent}'");
     let json_ct: Header = "Content-Type: application/json".parse().unwrap();
 
     for mut req in server.incoming_requests() {

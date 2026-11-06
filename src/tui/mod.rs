@@ -442,7 +442,7 @@ impl App {
                 KeyCode::Char('T') => {
                     match self.e.templates(&Actor::User) {
                         Ok(items) if items.is_empty() => {
-                            self.status = "No templates yet — `crayon templates set <name>` or ask an agent".into()
+                            self.status = "No templates yet — `sunbox templates set <name>` or ask an agent".into()
                         }
                         Ok(items) => self.overlay = Overlay::Templates { items, sel: 0, reply_to: Some(id) },
                         Err(e) => self.status = format!("Error: {e:#}"),
@@ -591,7 +591,7 @@ impl App {
                                 match self.e.default_account() {
                                     Ok(Some(next)) => self.switch_account(&next),
                                     _ => {
-                                        self.status = "Signed out of every account — `crayon auth login` to come back".into();
+                                        self.status = "Signed out of every account — `sunbox auth login` to come back".into();
                                         self.quit = true;
                                     }
                                 }
@@ -918,13 +918,13 @@ impl App {
         f.render_widget(block, r);
         let [hdr, sep, body] =
             Layout::vertical([Constraint::Length(4), Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
-        let cursor = Span::styled("▏", Style::new().fg(self.th.crayon));
+        let cursor = Span::styled("▏", Style::new().fg(self.th.sun));
         let header: Vec<Line> = (0..4)
             .map(|i| {
                 let focused = form.focus == i;
                 let label = Span::styled(
                     format!("{:>8}  ", FIELD_NAMES[i]),
-                    if focused { Style::new().fg(self.th.crayon).bold() } else { Style::new().fg(self.th.muted) },
+                    if focused { Style::new().fg(self.th.sun).bold() } else { Style::new().fg(self.th.muted) },
                 );
                 let mut l = vec![label, Span::raw(form.fields[i].clone())];
                 if focused {
@@ -1026,8 +1026,8 @@ impl App {
         let counts = self.counts();
         let rule = Block::new().borders(Borders::BOTTOM).border_style(Style::new().fg(self.th.rule));
         let mut spans = vec![
-            Span::styled(" ▌", Style::new().fg(self.th.crayon)),
-            Span::styled("Crayon Box ", Style::new().fg(self.th.bright).bold()),
+            Span::styled(" ▌", Style::new().fg(self.th.sun)),
+            Span::styled("Sunbox ", Style::new().fg(self.th.bright).bold()),
             Span::raw("  "),
         ];
         self.hits.tabs.clear();
@@ -1081,10 +1081,10 @@ impl App {
                 }
                 let mut subj = vec![];
                 if t.starred {
-                    subj.push(Span::styled("★ ", Style::new().fg(th.crayon)));
+                    subj.push(Span::styled("★ ", Style::new().fg(th.sun)));
                 }
                 if t.needs_reply {
-                    subj.push(Span::styled(" reply ", Style::new().fg(th.on_chip).bg(th.crayon)));
+                    subj.push(Span::styled(" reply ", Style::new().fg(th.on_chip).bg(th.sun)));
                     subj.push(Span::raw(" "));
                 }
                 subj.push(Span::styled(t.subject.clone(), subj_style));
@@ -1226,7 +1226,7 @@ impl App {
         } else if self.status.starts_with("Error") {
             Span::styled(format!(" {}", self.status), Style::new().fg(self.th.error))
         } else {
-            Span::styled(format!(" {}", self.status), Style::new().fg(self.th.crayon))
+            Span::styled(format!(" {}", self.status), Style::new().fg(self.th.sun))
         };
         f.render_widget(Paragraph::new(text), area);
     }
@@ -1261,7 +1261,7 @@ impl App {
                 ];
                 let lines: Vec<Line> = keys
                     .iter()
-                    .map(|(k, d)| Line::from(vec![Span::styled(format!("{k:>10}  "), Style::new().fg(self.th.crayon).bold()), Span::raw(*d)]))
+                    .map(|(k, d)| Line::from(vec![Span::styled(format!("{k:>10}  "), Style::new().fg(self.th.sun).bold()), Span::raw(*d)]))
                     .collect();
                 let r = centered(area, 70, lines.len() as u16 + 4);
                 f.render_widget(Clear, r);
@@ -1282,7 +1282,7 @@ impl App {
                     .iter()
                     .enumerate()
                     .map(|(i, a)| {
-                        let style = if i == list.sel { Style::new().fg(self.th.on_chip).bg(self.th.crayon) } else { Style::new().fg(self.th.fg) };
+                        let style = if i == list.sel { Style::new().fg(self.th.on_chip).bg(self.th.sun) } else { Style::new().fg(self.th.fg) };
                         let current = if *a == self.me { Span::styled(" ● ", Style::new().fg(self.th.accent)) } else { Span::raw("   ") };
                         let default = if list.default.as_deref() == Some(a.as_str()) { Span::styled("  default", Style::new().fg(self.th.muted)) } else { Span::raw("") };
                         Line::from(vec![current, Span::styled(format!(" {:<40} ", a), style), default])
@@ -1304,7 +1304,7 @@ impl App {
                     .iter()
                     .enumerate()
                     .map(|(i, t)| {
-                        let style = if i == *sel { Style::new().fg(self.th.on_chip).bg(self.th.crayon) } else { Style::new() };
+                        let style = if i == *sel { Style::new().fg(self.th.on_chip).bg(self.th.sun) } else { Style::new() };
                         let desc = if t.description.is_empty() { t.body.lines().next().unwrap_or("") } else { &t.description };
                         Line::from(vec![Span::styled(format!(" {:<20} ", t.name), style), Span::styled(format!(" {desc}"), Style::new().fg(self.th.muted))])
                     })

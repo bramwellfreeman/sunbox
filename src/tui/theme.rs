@@ -9,8 +9,8 @@ use std::time::SystemTime;
 #[derive(Clone)]
 pub struct Theme {
     pub accent: Color,
-    /// The crayon highlight: cursor, focused labels, status line, stars.
-    pub crayon: Color,
+    /// The sun highlight: cursor, focused labels, status line, stars.
+    pub sun: Color,
     pub muted: Color,
     pub fg: Color,
     pub bright: Color,
@@ -29,7 +29,7 @@ impl Default for Theme {
     fn default() -> Self {
         Theme {
             accent: Color::Rgb(59, 91, 255),
-            crayon: Color::Rgb(255, 200, 40),
+            sun: Color::Rgb(255, 200, 40),
             muted: Color::Rgb(142, 142, 153),
             fg: Color::Reset,
             bright: Color::White,
@@ -79,7 +79,7 @@ impl Theme {
         let bg = c("background", Color::Black);
         Some(Theme {
             accent: c("accent", d.accent),
-            crayon: c("yellow", d.crayon),
+            sun: c("yellow", d.sun),
             muted: c("dark_foreground", d.muted),
             fg: c("foreground", d.fg),
             bright: c("bright_foreground", d.bright),
@@ -118,7 +118,7 @@ impl Theme {
         Block::bordered()
             .style(Style::new().bg(self.popup_bg).fg(self.fg))
             .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(self.crayon))
+            .border_style(Style::new().fg(self.sun))
             .title(Span::styled(title, Style::new().bold()))
     }
 }

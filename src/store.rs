@@ -27,7 +27,7 @@ impl Store {
     pub fn open() -> Result<Self> {
         let dir = config::data_dir();
         std::fs::create_dir_all(&dir)?;
-        let path = dir.join("crayon.db");
+        let path = dir.join("sunbox.db");
         let conn = Connection::open(&path)?;
         config::restrict(&path);
         conn.execute_batch(

@@ -1,4 +1,4 @@
-//! Paths + config file (`~/.config/crayon-box/config.toml`).
+//! Paths + config file (`~/.config/sunbox/config.toml`).
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -7,7 +7,7 @@ use std::path::PathBuf;
 /// Gmail scopes: read + send + label/archive. Matches the Mac app's grant.
 pub const SCOPES: &str = "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.send";
 
-/// The "Crayon Box" Desktop OAuth client (GCP project client-portal-494601).
+/// The "Crayon Box" Desktop OAuth client (GCP project client-portal-494601) — the app's old name.
 pub const DEFAULT_CLIENT_ID: &str =
     "630462177368-ms7b3m9ppd13hbkfkub4r2j7r1jism69.apps.googleusercontent.com";
 
@@ -66,11 +66,33 @@ impl Default for Agent {
 }
 
 pub fn config_dir() -> PathBuf {
-    dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("crayon-box")
+    dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("sunbox")
 }
 
 pub fn data_dir() -> PathBuf {
-    dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("crayon-box")
+    dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("sunbox")
+}
+
+/// One-time move from the pre-rename "Crayon Box" locations, so sign-ins and history carry over.
+pub fn migrate_from_crayon() {
+    let moves = [
+        (dirs::config_dir().map(|d| d.join("crayon-box")), config_dir()),
+        (dirs::data_dir().map(|d| d.join("crayon-box")), data_dir()),
+    ];
+    for (old, new) in moves {
+        if let Some(old) = old.filter(|o| o.exists() && !new.exists()) {
+            let _ = std::fs::rename(old, &new);
+        }
+    }
+    let dir = data_dir();
+    if !dir.join("sunbox.db").exists() {
+        for ext in ["", "-wal", "-shm"] {
+            let old = dir.join(format!("crayon.db{ext}"));
+            if old.exists() {
+                let _ = std::fs::rename(old, dir.join(format!("sunbox.db{ext}")));
+            }
+        }
+    }
 }
 
 pub fn config_path() -> PathBuf {
@@ -86,10 +108,10 @@ impl Config {
         } else {
             Config { google: Google::default(), agent: Agent::default(), mcp: Mcp::default() }
         };
-        if let Ok(id) = std::env::var("CRAYON_GOOGLE_CLIENT_ID") {
+        if let Ok(id) = std::env::var("SUNBOX_GOOGLE_CLIENT_ID") {
             cfg.google.client_id = id;
         }
-        if let Ok(secret) = std::env::var("CRAYON_GOOGLE_CLIENT_SECRET") {
+        if let Ok(secret) = std::env::var("SUNBOX_GOOGLE_CLIENT_SECRET") {
             cfg.google.client_secret = secret;
         }
         Ok(cfg)
@@ -112,7 +134,7 @@ impl Config {
     pub fn require(&self, perm: &str) -> Result<()> {
         if !self.allows(perm) {
             bail!(
-                "permission denied: agents lack '{perm}'. The user can grant it with `crayon agent allow {perm}`"
+                "permission denied: agents lack '{perm}'. The user can grant it with `sunbox agent allow {perm}`"
             );
         }
         Ok(())

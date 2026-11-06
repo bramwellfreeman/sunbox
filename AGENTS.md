@@ -1,11 +1,11 @@
-# Crayon Box — agent guide
+# Sunbox — agent guide
 
-Crayon Box is the user's Gmail plus a local store of **contact profiles**, **templates** and
+Sunbox is the user's Gmail plus a local store of **contact profiles**, **templates** and
 **routines**. Two ways in, same engine, same permissions:
 
-- **MCP** (preferred): `crayon mcp` on stdio. Register with `crayon agent install claude`
-  (or `codex`), or point any MCP client at `crayon mcp`.
-- **CLI**: every command takes `--json`. `crayon --help`, `crayon <cmd> --help`.
+- **MCP** (preferred): `sunbox mcp` on stdio. Register with `sunbox agent install claude`
+  (or `codex`), or point any MCP client at `sunbox mcp`.
+- **CLI**: every command takes `--json`. `sunbox --help`, `sunbox <cmd> --help`.
 
 ## Accounts
 
@@ -16,7 +16,7 @@ routine can set `"account"` to watch a specific one.
 
 ## Permissions
 
-The user decides what agents may do (`crayon agent permissions`):
+The user decides what agents may do (`sunbox agent permissions`):
 
 | permission | allows | default |
 |---|---|---|
@@ -28,18 +28,18 @@ The user decides what agents may do (`crayon agent permissions`):
 | exec | routines may run shell commands | ✗ |
 
 Denied calls fail with a message that tells the user how to grant the permission. Every agent and routine
-action goes into the audit log (`crayon agent audit` / the `get_audit_log` tool). **Prefer drafts**
+action goes into the audit log (`sunbox agent audit` / the `get_audit_log` tool). **Prefer drafts**
 unless the user explicitly asked you to send.
 
 ## Mail
 
 | MCP tool | CLI |
 |---|---|
-| `inbox_triage` | `crayon inbox --filter todo\|primary\|bulk\|starred --json` |
-| `search_threads {query}` | `crayon search 'from:x newer_than:7d' --json` |
-| `get_thread {thread_id, format}` | `crayon read <id> [--full] --json` |
-| `preview_email` / `create_draft` / `send_email` | `crayon send --to … --body … [--reply <id>] [--template t --var k=v] [--draft\|--dry-run] -y` |
-| `archive_thread`, `star_thread`, `mark_read`, `label_thread` | `crayon archive\|star\|mark-read\|label` |
+| `inbox_triage` | `sunbox inbox --filter todo\|primary\|bulk\|starred --json` |
+| `search_threads {query}` | `sunbox search 'from:x newer_than:7d' --json` |
+| `get_thread {thread_id, format}` | `sunbox read <id> [--full] --json` |
+| `preview_email` / `create_draft` / `send_email` | `sunbox send --to … --body … [--reply <id>] [--template t --var k=v] [--draft\|--dry-run] -y` |
+| `archive_thread`, `star_thread`, `mark_read`, `label_thread` | `sunbox archive\|star\|mark-read\|label` |
 
 `get_thread` returns a `transcript`: quoted history and signatures stripped, one block per message.
 That's the cheapest way to read a conversation. Replies need only `reply_to_thread`: the recipient,
@@ -56,7 +56,7 @@ That's the cheapest way to read a conversation. Replies need only `reply_to_thre
 `upsert_contact` merges: only the fields you send change, tags are added, and `fields` keys merge
 (set a key to `""` to delete it). Check `get_contact` before writing to someone and follow their `tone`.
 `suggest_contacts` lists frequent correspondents with no profile yet.
-CLI: `crayon contacts set jane@hall.org --tone "warm" --field instrument=cello` or `--from-json -`.
+CLI: `sunbox contacts set jane@hall.org --tone "warm" --field instrument=cello` or `--from-json -`.
 
 ## Templates
 
@@ -69,8 +69,8 @@ reported (`missing_vars`), and `send` refuses to go out with any left. Use `rend
 ## Routines
 
 A routine selects threads with a Gmail query and runs ordered actions on each **new** match (a thread
-re-triggers only when a newer message arrives). `crayon routines tick` runs the due ones; the user's
-systemd timer (`crayon routines install-timer`) calls it every few minutes.
+re-triggers only when a newer message arrives). `sunbox routines tick` runs the due ones; the user's
+systemd timer (`sunbox routines install-timer`) calls it every few minutes.
 
 ```json
 {
@@ -89,9 +89,9 @@ systemd timer (`crayon routines install-timer`) calls it every few minutes.
 
 Actions: `label {name}`, `archive`, `star`, `mark_read`, `draft {template, vars}`,
 `send {template, vars}` (needs `send`), `notify {message}`, and `exec {command}` (needs `exec`).
-`exec` gets the thread summary as JSON on stdin plus `CRAYON_THREAD_ID`, `CRAYON_FROM` and
-`CRAYON_SUBJECT`, so it can hand off to another agent, e.g.
-`claude -p "Summarise thread $CRAYON_THREAD_ID with the crayon tools and save a draft reply"`.
+`exec` gets the thread summary as JSON on stdin plus `SUNBOX_THREAD_ID`, `SUNBOX_FROM` and
+`SUNBOX_SUBJECT`, so it can hand off to another agent, e.g.
+`claude -p "Summarise thread $SUNBOX_THREAD_ID with the sunbox tools and save a draft reply"`.
 
-Test with `run_routines {name, dry_run: true}` (CLI: `crayon routines run <name> --dry-run`) before
-relying on it. CLI create: `crayon routines set routine.json` (or `-` for stdin).
+Test with `run_routines {name, dry_run: true}` (CLI: `sunbox routines run <name> --dry-run`) before
+relying on it. CLI create: `sunbox routines set routine.json` (or `-` for stdin).

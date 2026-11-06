@@ -127,7 +127,7 @@ pub enum RoutineAction {
         message: String,
     },
     /// Run a shell command with the thread as JSON on stdin and
-    /// CRAYON_THREAD_ID / CRAYON_FROM / CRAYON_SUBJECT in env (needs `exec`).
+    /// SUNBOX_THREAD_ID / SUNBOX_FROM / SUNBOX_SUBJECT in env (needs `exec`).
     Exec { command: String },
 }
 
@@ -138,7 +138,7 @@ pub struct Routine {
     pub description: String,
     /// Gmail search query selecting threads, e.g. "from:venue.org is:unread".
     pub query: String,
-    /// Run at most every N minutes when `crayon routines tick` fires.
+    /// Run at most every N minutes when `sunbox routines tick` fires.
     #[serde(default = "default_every")]
     pub every_minutes: u32,
     #[serde(default = "default_true")]

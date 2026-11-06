@@ -1,36 +1,36 @@
-# ✏️ Crayon Box — terminal edition
+# ☀️ Sunbox — your inbox, at sunrise
 
 Gmail in the terminal for Linux: a keyboard-driven inbox for you, plus a CLI and MCP server so AI
 agents can read, draft and send mail, and keep **contact profiles**, **templates** and **routines**.
-Sibling of the Dioxus desktop app (`~/Projects/crayon-box` on the Mac); same Google OAuth client and the
+Formerly "Crayon Box". Sibling of the Dioxus desktop app (`~/Projects/crayon-box` on the Mac); same Google OAuth client and the
 same privacy posture: mail goes straight to the Gmail API and everything else stays local.
 
 ## Install
 
 ```sh
-cargo build --release && install -Dm755 target/release/crayon ~/.local/bin/crayon
-crayon auth setup        # paste the "Crayon Box" OAuth client secret
-crayon auth login        # browser consent (unverified-app warning → Advanced → Continue)
-crayon                   # inbox
+cargo build --release && install -Dm755 target/release/sunbox ~/.local/bin/sunbox
+sunbox auth setup        # paste the "Crayon Box" OAuth client secret
+sunbox auth login        # browser consent (unverified-app warning → Advanced → Continue)
+sunbox                   # inbox
 ```
 
 ## Use it
 
-- **TUI**: `crayon`. Tabs To do · Primary · Starred · Newsletters · All. `↵` opens a thread, `r` replies,
+- **TUI**: `sunbox`. Tabs To do · Primary · Starred · Newsletters · All. `↵` opens a thread, `r` replies,
   `T` replies from a template, `c` composes, `f` forwards, `e` archives, `s` stars, `l` labels,
   `/` searches, `?` shows help. You write in `$EDITOR`, then choose send / draft / edit again / discard.
-- **CLI**: `crayon inbox`, `search`, `read`, `send`, `archive`, `contacts …`, `templates …`, `routines …`.
+- **CLI**: `sunbox inbox`, `search`, `read`, `send`, `archive`, `contacts …`, `templates …`, `routines …`.
   Add `--json` for machine output.
-- **Agents**: `crayon agent install claude` registers the MCP server. See [AGENTS.md](AGENTS.md).
-- **Routines**: `crayon routines install-timer` adds a systemd user timer that runs due routines.
-- **Accounts**: run `crayon auth login` again to add another Google account. `crayon auth list` shows them,
-  `crayon auth default <email>` picks the default, and `--account <email>` (or `$CRAYON_ACCOUNT`) works
+- **Agents**: `sunbox agent install claude` registers the MCP server. See [AGENTS.md](AGENTS.md).
+- **Routines**: `sunbox routines install-timer` adds a systemd user timer that runs due routines.
+- **Accounts**: run `sunbox auth login` again to add another Google account. `sunbox auth list` shows them,
+  `sunbox auth default <email>` picks the default, and `--account <email>` (or `$SUNBOX_ACCOUNT`) works
   on any command. In the TUI, `a` switches, adds, sets the default or signs out.
 
 ## Where things live
 
-- `~/.config/crayon-box/config.toml`: OAuth client and agent permissions (chmod 600)
-- `~/.local/share/crayon-box/crayon.db`: tokens, contacts, templates, routines, audit log (chmod 600)
+- `~/.config/sunbox/config.toml`: OAuth client and agent permissions (chmod 600)
+- `~/.local/share/sunbox/sunbox.db`: tokens, contacts, templates, routines, audit log (chmod 600)
 
 ## Code
 

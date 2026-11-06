@@ -1,11 +1,11 @@
 [package]
-name = "crayon-box-term"
+name = "sunbox"
 version = "0.1.0"
 edition = "2021"
-description = "Crayon Box Email for the terminal — Gmail TUI + CLI + MCP server built for AI agents"
+description = "Sunbox — your inbox, at sunrise — Gmail TUI + CLI + MCP server built for AI agents"
 
 [[bin]]
-name = "crayon"
+name = "sunbox"
 path = "src/main.rs"
 
 [dependencies]

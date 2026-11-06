@@ -28,7 +28,7 @@ fn random(n: usize) -> String {
 pub fn sign_in(cfg: &Config, open_browser: bool, quiet: bool) -> Result<TokenResponse> {
     if cfg.google.client_secret.is_empty() {
         bail!(
-            "no Google client secret configured. Run `crayon auth setup` (or set CRAYON_GOOGLE_CLIENT_SECRET)"
+            "no Google client secret configured. Run `sunbox auth setup` (or set SUNBOX_GOOGLE_CLIENT_SECRET)"
         );
     }
     let listener = TcpListener::bind("127.0.0.1:0")?;
@@ -82,7 +82,7 @@ pub fn sign_in(cfg: &Config, open_browser: bool, quiet: bool) -> Result<TokenRes
         } else if param("state").as_deref() != Some(&state) {
             ("400 Bad Request", "State mismatch — please retry.".into())
         } else {
-            ("200 OK", "Crayon Box is signed in. You can close this tab.".into())
+            ("200 OK", "Sunbox is signed in. You can close this tab.".into())
         };
         let body = format!(
             "<html><body style=\"font-family:sans-serif;padding:3em\"><h2>✏️ {msg}</h2></body></html>"
@@ -119,7 +119,7 @@ pub fn refresh(cfg: &Config, refresh_token: &str) -> Result<TokenResponse> {
         ("refresh_token", refresh_token),
         ("grant_type", "refresh_token"),
     ]);
-    parse_token(resp).context("refreshing access token (try `crayon auth login` again)")
+    parse_token(resp).context("refreshing access token (try `sunbox auth login` again)")
 }
 
 fn parse_token(resp: Result<ureq::Response, ureq::Error>) -> Result<TokenResponse> {

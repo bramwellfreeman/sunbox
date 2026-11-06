@@ -89,9 +89,9 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Works as `account`, else `$CRAYON_ACCOUNT`, else the default account.
+    /// Works as `account`, else `$SUNBOX_ACCOUNT`, else the default account.
     pub fn open(account: Option<String>) -> Result<Self> {
-        let acct = account.or_else(|| std::env::var("CRAYON_ACCOUNT").ok()).filter(|a| !a.trim().is_empty());
+        let acct = account.or_else(|| std::env::var("SUNBOX_ACCOUNT").ok()).filter(|a| !a.trim().is_empty());
         Ok(Self { cfg: Config::load()?, store: Store::open()?, acct, token: Mutex::new(None) })
     }
 
@@ -596,7 +596,7 @@ impl Engine {
                     message.replace("{{from}}", &t.from_name).replace("{{subject}}", &t.subject)
                 };
                 std::process::Command::new("notify-send")
-                    .args(["-a", "Crayon Box", "Crayon Box", &msg])
+                    .args(["-a", "Sunbox", "Sunbox", &msg])
                     .status()
                     .context("running notify-send")?;
                 Ok("notified".into())
@@ -605,9 +605,9 @@ impl Engine {
                 use std::io::Write;
                 let mut child = std::process::Command::new("sh")
                     .args(["-c", command])
-                    .env("CRAYON_THREAD_ID", &t.id)
-                    .env("CRAYON_FROM", &t.from_email)
-                    .env("CRAYON_SUBJECT", &t.subject)
+                    .env("SUNBOX_THREAD_ID", &t.id)
+                    .env("SUNBOX_FROM", &t.from_email)
+                    .env("SUNBOX_SUBJECT", &t.subject)
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
@@ -628,7 +628,7 @@ impl Engine {
 
 fn not_signed_in(account: Option<&str>) -> anyhow::Error {
     match account {
-        Some(a) => anyhow!("{a} isn't signed in — run `crayon auth login` and pick it, or see `crayon auth list`"),
-        None => anyhow!("not signed in — run `crayon auth login`"),
+        Some(a) => anyhow!("{a} isn't signed in — run `sunbox auth login` and pick it, or see `sunbox auth list`"),
+        None => anyhow!("not signed in — run `sunbox auth login`"),
     }
 }
