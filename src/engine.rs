@@ -457,6 +457,88 @@ impl Engine {
         Ok(out)
     }
 
+    /// Rebuild the address book for this account from recent mail: people you
+    /// wrote to (sent mail) and real senders who wrote to you.
+    pub fn sync_people(&self, actor: &Actor) -> Result<usize> {
+        self.act(actor, "read", "sync_people", "", || {
+            let g = self.gmail()?;
+            let me = self.account()?;
+            let mut seen = g.correspondents("in:sent", 400, &me)?;
+            seen.extend(g.correspondents("-in:sent -category:promotions -category:social -category:updates -category:forums", 200, &me)?);
+            let mine = self.store.accounts()?;
+            let mut by: BTreeMap<String, Person> = BTreeMap::new();
+            for (name, email, date, from_me) in seen {
+                if mine.iter().any(|a| a.eq_ignore_ascii_case(&email)) {
+                    continue;
+                }
+                let p = by.entry(email.clone()).or_insert_with(|| Person { email: email.clone(), ..Default::default() });
+                p.score += if from_me { 3 } else { 1 };
+                // Keep the newest real name (sent-mail headers are often bare addresses).
+                let real = !name.is_empty() && !name.eq_ignore_ascii_case(&email);
+                if real && (date >= p.last_seen || p.name.is_empty()) {
+                    p.name = name;
+                }
+                p.last_seen = p.last_seen.max(date);
+            }
+            let people: Vec<Person> = by.into_values().collect();
+            self.store.save_people(&me, &people)?;
+            self.store.set_setting(&format!("people_synced:{me}"), &chrono::Utc::now().timestamp().to_string())?;
+            Ok(people.len())
+        })
+    }
+
+    /// True when this account's address book is missing or over `hours` old.
+    pub fn people_stale(&self, hours: i64) -> bool {
+        let Ok(me) = self.account() else { return false };
+        let at = self.store.setting(&format!("people_synced:{me}")).ok().flatten().and_then(|v| v.parse::<i64>().ok());
+        at.is_none_or(|t| chrono::Utc::now().timestamp() - t > hours * 3600)
+    }
+
+    /// Sync first if this account has never been scanned (CLI / agent entry points).
+    pub fn ensure_people(&self, actor: &Actor) -> Result<()> {
+        if self.people_stale(24 * 365 * 100) {
+            self.sync_people(actor)?;
+        }
+        Ok(())
+    }
+
+    /// Search saved profiles plus everyone seen in mail, best match first.
+    /// Every word of `query` must appear in the name, address or company; an
+    /// empty query lists everyone by how often you trade mail.
+    pub fn find_people(&self, actor: &Actor, query: &str, limit: usize) -> Result<Vec<Person>> {
+        self.act(actor, "read", "find_people", query, || {
+            let mut by: BTreeMap<String, Person> = self.store.people()?.into_iter().map(|p| (p.email.clone(), p)).collect();
+            for c in self.store.contacts()? {
+                let p = by.entry(c.email.clone()).or_insert_with(|| Person { email: c.email.clone(), ..Default::default() });
+                p.profile = true;
+                if !c.name.is_empty() {
+                    p.name = c.name;
+                }
+                p.company = c.company;
+            }
+            let mine = self.store.accounts()?;
+            let words: Vec<String> = query.to_lowercase().split_whitespace().map(String::from).collect();
+            let mut hits: Vec<(i64, Person)> = by
+                .into_values()
+                .filter(|p| !mine.iter().any(|a| a.eq_ignore_ascii_case(&p.email)))
+                .filter_map(|p| {
+                    let hay = format!("{} {} {}", p.name, p.email, p.company).to_lowercase();
+                    if !words.iter().all(|w| hay.contains(w.as_str())) {
+                        return None;
+                    }
+                    // Word-start matches ("jan" → "Jane", "jane@…") beat mid-word ones.
+                    let starts = words.first().is_some_and(|w| {
+                        hay.split(|c: char| !c.is_alphanumeric()).any(|part| part.starts_with(w.as_str()))
+                    });
+                    let rank = if starts { 1_000_000 } else { 0 } + if p.profile { 100 } else { 0 } + p.score;
+                    Some((rank, p))
+                })
+                .collect();
+            hits.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.last_seen.cmp(&a.1.last_seen)));
+            Ok(hits.into_iter().take(limit).map(|(_, p)| p).collect())
+        })
+    }
+
     // ---------- templates ----------
 
     pub fn templates(&self, actor: &Actor) -> Result<Vec<Template>> {

@@ -111,6 +111,46 @@ impl Gmail {
         })
     }
 
+    /// Addresses on messages matching `query`: (name, email, unix millis, from_me).
+    /// From for received mail, To/Cc for mail `me` sent; bulk senders are skipped.
+    pub fn correspondents(&self, query: &str, max: usize, me: &str) -> Result<Vec<(String, String, i64, bool)>> {
+        let max_s = max.min(500).to_string();
+        let list = self.get("/messages", &[("maxResults", &max_s), ("q", query)])?;
+        let ids: Vec<String> = list["messages"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|m| m["id"].as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        let mut q = vec![("format", "metadata")];
+        for h in ["From", "To", "Cc", "List-Id", "List-Unsubscribe", "Precedence", "Auto-Submitted"] {
+            q.push(("metadataHeaders", h));
+        }
+        let mut out = Vec::new();
+        for chunk in ids.chunks(PARALLEL) {
+            let msgs: Vec<Result<Value>> = std::thread::scope(|s| {
+                let q = &q;
+                let hs: Vec<_> = chunk.iter().map(|id| s.spawn(move || self.get(&format!("/messages/{id}"), q))).collect();
+                hs.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            for m in msgs {
+                let m = m?;
+                let date = m["internalDate"].as_str().and_then(|d| d.parse().ok()).unwrap_or(0);
+                let (from_name, from_email) = split_address(&header(&m, "From"));
+                if from_email.eq_ignore_ascii_case(me) {
+                    for h in ["To", "Cc"] {
+                        for a in split_address_list(&header(&m, h)) {
+                            let (n, e) = split_address(&a);
+                            out.push((n, e, date, true));
+                        }
+                    }
+                } else if !is_bulk(&m, &from_email) {
+                    out.push((from_name, from_email, date, false));
+                }
+            }
+        }
+        out.retain(|(_, e, _, _)| e.contains('@') && !e.eq_ignore_ascii_case(me));
+        Ok(out)
+    }
+
     pub fn thread(&self, id: &str) -> Result<ThreadDetail> {
         let t = self.get(&format!("/threads/{id}"), &[("format", "full")])?;
         let messages: Vec<Message> = t["messages"]
@@ -214,6 +254,26 @@ pub fn split_address(s: &str) -> (String, String) {
         }
     }
     (s.to_string(), s.to_lowercase())
+}
+
+/// Split an address header on commas that aren't inside quotes or <…>.
+pub fn split_address_list(s: &str) -> Vec<String> {
+    let (mut out, mut cur, mut quoted, mut angle) = (Vec::new(), String::new(), false, false);
+    for ch in s.chars() {
+        match ch {
+            '"' => quoted = !quoted,
+            '<' if !quoted => angle = true,
+            '>' if !quoted => angle = false,
+            ',' | ';' if !quoted && !angle => {
+                out.push(std::mem::take(&mut cur));
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(ch);
+    }
+    out.push(cur);
+    out.into_iter().map(|a| a.trim().to_string()).filter(|a| !a.is_empty()).collect()
 }
 
 fn is_bulk(msg: &Value, from_email: &str) -> bool {
@@ -339,6 +399,13 @@ fn encode_header(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn splits_address_lists() {
+        let l = split_address_list(r#""Doe, Jane" <jane@x.com>, bob@y.org; Al <al@z.io>"#);
+        assert_eq!(l, vec![r#""Doe, Jane" <jane@x.com>"#, "bob@y.org", "Al <al@z.io>"]);
+        assert_eq!(split_address(&l[0]), ("Doe, Jane".into(), "jane@x.com".into()));
+    }
 
     #[test]
     fn splits_addresses() {

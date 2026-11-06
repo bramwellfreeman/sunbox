@@ -42,7 +42,9 @@ impl Store {
                  last_date INTEGER NOT NULL, PRIMARY KEY (routine, thread_id));
              CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL,
                  actor TEXT NOT NULL, action TEXT NOT NULL, detail TEXT NOT NULL, ok INTEGER NOT NULL);
-             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS people (account TEXT NOT NULL, email TEXT NOT NULL, name TEXT NOT NULL,
+                 score INTEGER NOT NULL, last_seen INTEGER NOT NULL, PRIMARY KEY (account, email));",
         )?;
         Ok(Self { conn: Mutex::new(conn) })
     }
@@ -185,6 +187,35 @@ impl Store {
     }
     pub fn delete_contact(&self, email: &str) -> Result<()> {
         self.remove("contacts", "email", &email.to_lowercase())
+    }
+
+    // ---- people seen in mail ----
+
+    /// Replace what we know about these addresses for `account` (others are kept).
+    pub fn save_people(&self, account: &str, people: &[Person]) -> Result<()> {
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        for p in people {
+            tx.execute(
+                "INSERT INTO people VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(account, email) DO UPDATE SET
+                     name = excluded.name, score = excluded.score, last_seen = excluded.last_seen",
+                params![account, p.email, p.name, p.score, p.last_seen],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Everyone seen in any account's mail, merged by address.
+    pub fn people(&self) -> Result<Vec<Person>> {
+        let db = self.db();
+        let mut stmt = db.prepare(
+            "SELECT email, name, SUM(score), MAX(last_seen) FROM people GROUP BY email",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Person { email: r.get(0)?, name: r.get(1)?, score: r.get(2)?, last_seen: r.get(3)?, ..Default::default() })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     // ---- templates ----

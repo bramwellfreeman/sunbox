@@ -18,8 +18,9 @@ sunbox                   # inbox
 
 - **TUI**: `sunbox`. Tabs To do · Primary · Starred · Newsletters · All. `↵` opens a thread, `r` replies,
   `T` replies from a template, `c` composes, `f` forwards, `e` archives, `s` stars, `l` labels,
-  `/` searches, `?` shows help. You write in `$EDITOR`, then choose send / draft / edit again / discard.
-- **CLI**: `sunbox inbox`, `search`, `read`, `send`, `archive`, `contacts …`, `templates …`, `routines …`.
+  `/` searches, `C` finds a contact, `?` shows help. In To/Cc/Bcc, start typing a name or address
+  and pick a suggestion with ↑↓ + Tab/↵. You write in `$EDITOR`, then choose send / draft / edit again / discard.
+- **CLI**: `sunbox inbox`, `search`, `read`, `send`, `archive`, `contacts find <name>`, `contacts …`, `templates …`, `routines …`.
   Add `--json` for machine output.
 - **Agents**: `sunbox agent install claude` registers the MCP server. See [AGENTS.md](AGENTS.md).
 - **Routines**: `sunbox routines install-timer` adds a systemd user timer that runs due routines.

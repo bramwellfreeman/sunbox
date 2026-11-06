@@ -45,6 +45,15 @@ unless the user explicitly asked you to send.
 That's the cheapest way to read a conversation. Replies need only `reply_to_thread`: the recipient,
 `Re:` subject and In-Reply-To headers fill themselves in.
 
+## Finding people
+
+`find_people {query}` searches saved profiles **and** everyone seen in the user's mail (people they
+wrote to count triple), so use it to turn "email Ross about the concert" into an address before
+composing. Every word of the query must match the name, address or company; best match first, and
+`profile: true` means there's a saved profile worth reading with `get_contact`. Each result has a
+ready-to-use `"Name <email>"`-style address in `name` + `email`. The address book builds itself on
+first use. CLI: `sunbox contacts find ross --json`, `sunbox contacts sync` to rescan.
+
 ## Contact profiles
 
 ```json

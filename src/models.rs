@@ -67,6 +67,34 @@ pub struct Label {
     pub name: String,
 }
 
+/// Someone you can write to: a saved profile and/or an address seen in your mail.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Person {
+    pub email: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub company: String,
+    /// Has a saved contact profile.
+    pub profile: bool,
+    /// How often you trade mail with them (emails you sent them count triple).
+    pub score: i64,
+    /// Unix millis of the latest message with them, 0 if only a profile.
+    pub last_seen: i64,
+}
+
+impl Person {
+    /// "Jane Doe <jane@x.com>", or just the address when there's no real name.
+    pub fn address(&self) -> String {
+        if self.name.is_empty() || self.name.eq_ignore_ascii_case(&self.email) {
+            self.email.clone()
+        } else if self.name.contains([',', '"', '<', '>', ';']) {
+            format!("\"{}\" <{}>", self.name.replace('"', ""), self.email)
+        } else {
+            format!("{} <{}>", self.name, self.email)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Contact {
     pub email: String,
