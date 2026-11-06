@@ -215,7 +215,10 @@ impl Engine {
             let templates = self.store.templates()?;
             let prompt = format!(
                 "Inboxes: {}\n\nPersonal mail:\n{}\nNewsletters / notifications (only flag ones that genuinely matter, \
-                 e.g. security alerts, bills, deadlines):\n{}\nKnown client profiles:\n{}\nExisting templates: {}\n\n\
+                 e.g. security alerts, bills, deadlines):\n{}\nKnown client profiles:\n{}\nHandled outside email recently \
+                 (the user marked these important but took care of them another way, e.g. a call or in person; treat \
+                 similar mail from these people or about these topics as important, and don't suggest following up on \
+                 these threads):\n{}\nExisting templates: {}\n\n\
                  Rank what deserves the user's attention. Return `items` for every personal thread plus any notable \
                  notification, most important first. priority: urgent (needs action today), high, normal, low. \
                  action: reply, follow_up (the user is waiting on someone), read, archive, none. `why` is one short \
@@ -230,6 +233,16 @@ impl Engine {
                 personal.iter().map(|t| line(t, true)).collect::<String>(),
                 bulk.iter().map(|t| line(t, false)).collect::<String>(),
                 if profiles.is_empty() { "(none yet)\n".into() } else { profiles },
+                {
+                    let h = self.handled(20)?;
+                    if h.is_empty() {
+                        "(none)\n".to_string()
+                    } else {
+                        h.iter()
+                            .map(|h| format!("- {} {} <{}> “{}”: {}\n", &h.at[..h.at.len().min(10)], h.from_name, h.from_email, h.subject, if h.note.is_empty() { "(no note)" } else { &h.note }))
+                            .collect()
+                    }
+                },
                 if templates.is_empty() {
                     "(none)".to_string()
                 } else {
@@ -306,6 +319,57 @@ impl Engine {
     }
 
     /// Change one item of the stored briefing.
+    // ---------- handled another way ----------
+
+    /// Archive a thread the user took care of outside email, keeping `note` as a signal for
+    /// Claude: it goes on the sender's profile and into later briefings. Labelled Sunbox/Handled.
+    pub fn mark_handled(&self, actor: &Actor, thread_id: &str, note: &str) -> Result<Handled> {
+        let me = self.account()?;
+        let t = self.thread(actor, thread_id)?;
+        let (from_name, from_email) = t
+            .messages
+            .iter()
+            .rev()
+            .map(|m| split_address(&m.from))
+            .find(|(_, e)| !e.eq_ignore_ascii_case(&me))
+            .unwrap_or_default();
+        let from_email = from_email.to_lowercase();
+        self.label(actor, thread_id, "Sunbox/Handled", false)?;
+        self.archive(actor, thread_id)?;
+        let h = Handled {
+            thread_id: thread_id.to_string(),
+            account: me,
+            from_name,
+            from_email: from_email.clone(),
+            subject: t.subject.clone(),
+            note: note.trim().to_string(),
+            at: now(),
+        };
+        self.store.ai_put(&format!("handled:{thread_id}"), &h)?;
+        if from_email.contains('@') {
+            let old = self.store.contact(&from_email)?.unwrap_or_default();
+            let line = format!(
+                "{}: “{}” mattered and was handled outside email{}",
+                chrono::Local::now().format("%Y-%m-%d"),
+                t.subject,
+                if h.note.is_empty() { String::new() } else { format!(" ({})", h.note) }
+            );
+            let learned = if old.learned.trim().is_empty() { line } else { format!("{}\n{line}", old.learned.trim_end()) };
+            let name = if old.name.is_empty() { h.from_name.clone() } else { String::new() };
+            self.upsert_contact(actor, Contact { email: from_email, name, learned, ..Default::default() })?;
+        }
+        let _ = self.update_brief_item(thread_id, |i| i.action = "none".into());
+        Ok(h)
+    }
+
+    /// Most recent first.
+    pub fn handled(&self, limit: usize) -> Result<Vec<Handled>> {
+        let mut all: Vec<Handled> = self.store.ai_list("handled:")?;
+        all.sort_by(|a, b| b.at.cmp(&a.at));
+        all.truncate(limit);
+        Ok(all)
+    }
+
     pub fn update_brief_item(&self, thread_id: &str, f: impl FnOnce(&mut BriefItem)) -> Result<()> {
         if let Some(mut b) = self.last_briefing()? {
             if let Some(i) = b.items.iter_mut().find(|i| i.thread_id == thread_id) {

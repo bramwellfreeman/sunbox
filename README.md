@@ -41,6 +41,10 @@ sunbox                   # inbox
   your note, `L` has Claude study a sender. It runs on the Claude Code CLI (your plan) or, with
   `ANTHROPIC_API_KEY`, the API. Set `model`, `effort` and an `about` line under `[claude]` in the config.
   CLI: `sunbox claude brief|actions|do|draft|drafts|learn|template|status`.
+- **Handled another way** (`H`, or the last button under space in ✦ Claude): for mail you dealt with
+  by phone, in person or elsewhere. Add a short note and it's archived (labelled `Sunbox/Handled`),
+  the note goes on the sender's profile, and later briefings treat similar mail as important without
+  suggesting a follow-up. `sunbox handled <id> --note …`; `sunbox handled` lists them.
 - **Autocorrect** while you write: common typos are fixed the moment a word ends (teh → the,
   dont → don't, i → I), and a second after you pause Claude fixes spelling and capitals (never
   wording). Fixed words flash; Ctrl+Z undoes the last fix and won't redo it; Ctrl+G turns it off.
