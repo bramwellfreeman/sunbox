@@ -160,7 +160,7 @@ pub enum RoutineAction {
         #[serde(default)]
         vars: BTreeMap<String, String>,
     },
-    /// Desktop notification via notify-send.
+    /// Desktop notification (notify-send / macOS Notification Center).
     Notify {
         #[serde(default)]
         message: String,

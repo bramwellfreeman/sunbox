@@ -7,12 +7,19 @@ same privacy posture: mail goes straight to the Gmail API and everything else st
 
 ## Install
 
+On a Mac (Apple Silicon or Intel) or Linux (x86_64), in Terminal:
+
 ```sh
-cargo build --release && install -Dm755 target/release/sunbox ~/.local/bin/sunbox
+curl -fsSL https://github.com/bramwellfreeman/sunbox/releases/latest/download/install.sh | sh
 sunbox auth setup        # paste the "Crayon Box" OAuth client secret
 sunbox auth login        # browser consent (unverified-app warning → Advanced → Continue)
 sunbox                   # inbox
 ```
+
+It installs to `~/.local/bin` (set `SUNBOX_BIN` to change that) and adds it to your PATH if needed.
+Downloading with curl keeps macOS from quarantining the binary, so it runs without a Gatekeeper prompt.
+From source: `cargo build --release && install -Dm755 target/release/sunbox ~/.local/bin/sunbox`.
+Releases are built by `.github/workflows/release.yml` when a `v*` tag is pushed.
 
 ## Use it
 
@@ -65,8 +72,8 @@ sunbox                   # inbox
 
 ## Where things live
 
-- `~/.config/sunbox/config.toml`: OAuth client and agent permissions (chmod 600)
-- `~/.local/share/sunbox/sunbox.db`: tokens, contacts, templates, routines, audit log (chmod 600)
+- `~/.config/sunbox/config.toml` (macOS: `~/Library/Application Support/sunbox/`): OAuth client and agent permissions (chmod 600)
+- `~/.local/share/sunbox/sunbox.db` (macOS: same folder as the config): tokens, contacts, templates, routines, audit log (chmod 600)
 
 ## Code
 

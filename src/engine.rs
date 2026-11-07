@@ -8,7 +8,7 @@ use crate::models::*;
 use crate::oauth;
 use crate::store::{now, Store, Tokens};
 use crate::templates;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -708,10 +708,7 @@ impl Engine {
                 } else {
                     message.replace("{{from}}", &t.from_name).replace("{{subject}}", &t.subject)
                 };
-                std::process::Command::new("notify-send")
-                    .args(["-a", "Sunbox", "Sunbox", &msg])
-                    .status()
-                    .context("running notify-send")?;
+                crate::config::notify(&msg)?;
                 Ok("notified".into())
             }
             RoutineAction::Exec { command } => self.act(actor, "exec", "exec", command, || {

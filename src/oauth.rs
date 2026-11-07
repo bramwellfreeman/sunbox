@@ -49,7 +49,7 @@ pub fn sign_in(cfg: &Config, open_browser: bool, quiet: bool) -> Result<TokenRes
         eprintln!("Open this URL to sign in with Google:\n\n  {url}\n");
     }
     if open_browser {
-        let _ = std::process::Command::new("xdg-open")
+        let _ = std::process::Command::new(crate::config::OPENER)
             .arg(&url)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

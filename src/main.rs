@@ -963,6 +963,44 @@ fn print_reports(reps: &Vec<engine::RoutineReport>) {
     }
 }
 
+/// macOS: a launchd agent that runs `sunbox routines tick` every few minutes.
+#[cfg(target_os = "macos")]
+fn install_timer(every: u32) -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let dir = dirs::home_dir().ok_or_else(|| anyhow!("no home dir"))?.join("Library/LaunchAgents");
+    std::fs::create_dir_all(&dir)?;
+    let plist = dir.join("fun.yelloworange.sunbox.routines.plist");
+    let log = config::data_dir().join("routines.log");
+    std::fs::write(
+        &plist,
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>fun.yelloworange.sunbox.routines</string>
+  <key>ProgramArguments</key><array><string>{}</string><string>routines</string><string>tick</string></array>
+  <key>StartInterval</key><integer>{}</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>{}</string>
+  <key>StandardErrorPath</key><string>{}</string>
+</dict></plist>
+"#,
+            exe.display(),
+            every * 60,
+            log.display(),
+            log.display()
+        ),
+    )?;
+    let _ = std::process::Command::new("launchctl").arg("unload").arg(&plist).status();
+    let st = std::process::Command::new("launchctl").arg("load").arg("-w").arg(&plist).status()?;
+    if !st.success() {
+        bail!("launchctl failed ({st})");
+    }
+    println!("✓ routines run every {every} min (launchd). Log: {}", log.display());
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
 fn install_timer(every: u32) -> Result<()> {
     let exe = std::env::current_exe()?;
     let dir = dirs::config_dir().ok_or_else(|| anyhow!("no config dir"))?.join("systemd/user");

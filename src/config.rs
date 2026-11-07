@@ -148,6 +148,21 @@ impl Default for Agent {
     }
 }
 
+/// The command that opens a URL in the default browser.
+pub const OPENER: &str = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+
+/// A desktop notification (notify-send on Linux, Notification Center on macOS).
+pub fn notify(msg: &str) -> Result<()> {
+    let st = if cfg!(target_os = "macos") {
+        let quoted = msg.replace('\\', "\\\\").replace('"', "\\\"");
+        std::process::Command::new("osascript").args(["-e", &format!("display notification \"{quoted}\" with title \"Sunbox\"")]).status()
+    } else {
+        std::process::Command::new("notify-send").args(["-a", "Sunbox", "Sunbox", msg]).status()
+    };
+    st.context("showing a notification")?;
+    Ok(())
+}
+
 pub fn config_dir() -> PathBuf {
     dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("sunbox")
 }

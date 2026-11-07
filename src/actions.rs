@@ -135,7 +135,7 @@ pub fn open_url(url: &str) -> Result<()> {
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         bail!("not a web link: {url}");
     }
-    Command::new("xdg-open").arg(url).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
+    Command::new(crate::config::OPENER).arg(url).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
     Ok(())
 }
 
