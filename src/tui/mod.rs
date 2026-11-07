@@ -2121,7 +2121,7 @@ impl App {
                     ("J K", "scroll the preview pane (wide terminals)"),
                     ("mouse", "click to select, double-click to open, wheel scrolls, right-click back"),
                     ("a", "inboxes: tick several to show together · add · default · sign out"),
-                    (",  ⚙", "settings: accounts, and which AI assistant to use (Claude, ChatGPT, Gemini)"),
+                    (",  ⚙", "settings: accounts, and which AI assistant to use (Claude, ChatGPT, Gemini, Grok)"),
                     ("6", "Sent: what you sent, and who hasn't replied yet"),
                     ("7", "✦ Claude: your inbox sorted into categories, drafted replies to check & send"),
                     ("space", "✦ Claude: the buttons Claude suggests (calendar, task, link, unsubscribe…)"),

@@ -10,7 +10,7 @@ use serde_json::json;
 
 pub const MENU: [(&str, &str); 2] = [
     ("Accounts", "switch, add, pick the default, sign out, show inboxes together"),
-    ("AI assistant", "pick Claude, ChatGPT or Gemini and sign in"),
+    ("AI assistant", "pick Claude, ChatGPT, Gemini or Grok and sign in"),
 ];
 
 /// The AI assistant page.
@@ -31,6 +31,7 @@ fn model_of(c: &config::Claude, id: &str) -> String {
     let m = match id {
         "codex" | "openai" => &c.openai_model,
         "gemini" | "gemini-api" => &c.gemini_model,
+        "grok" | "xai" => &c.grok_model,
         _ => &c.model,
     };
     if m.is_empty() { "default model".into() } else { m.clone() }
@@ -158,6 +159,7 @@ impl App {
                     match ai::key_field(&id) {
                         Some("anthropic_key") => c.anthropic_key = buf.clone(),
                         Some("openai_key") => c.openai_key = buf.clone(),
+                        Some("xai_key") => c.xai_key = buf.clone(),
                         _ => c.gemini_key = buf.clone(),
                     }
                     c.backend = id.clone();
@@ -169,6 +171,7 @@ impl App {
                 save(|c| match id.as_str() {
                     "codex" | "openai" => c.openai_model = buf.clone(),
                     "gemini" | "gemini-api" => c.gemini_model = buf.clone(),
+                    "grok" | "xai" => c.grok_model = buf.clone(),
                     _ => c.model = buf.clone(),
                 })
                 .map(|_| format!("✓ Model set to {}", if buf.is_empty() { "the default" } else { &buf }))

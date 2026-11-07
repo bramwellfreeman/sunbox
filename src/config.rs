@@ -76,11 +76,15 @@ pub struct Claude {
     pub openai_key: String,
     #[serde(default)]
     pub gemini_key: String,
+    #[serde(default)]
+    pub xai_key: String,
     /// Models for the other assistants ("" = that tool's default).
     #[serde(default)]
     pub openai_model: String,
     #[serde(default)]
     pub gemini_model: String,
+    #[serde(default)]
+    pub grok_model: String,
 }
 
 fn default_true() -> bool {
@@ -107,7 +111,7 @@ impl Default for Claude {
     fn default() -> Self {
         Self { backend: default_backend(), model: default_model(), effort: default_effort(), command: default_command(), about: String::new(),
             autocorrect: true, autocorrect_model: String::new(), autocorrect_effort: default_autocorrect_effort(),
-            anthropic_key: String::new(), openai_key: String::new(), gemini_key: String::new(), openai_model: String::new(), gemini_model: String::new() }
+            anthropic_key: String::new(), openai_key: String::new(), gemini_key: String::new(), xai_key: String::new(), grok_model: String::new(), openai_model: String::new(), gemini_model: String::new() }
     }
 }
 

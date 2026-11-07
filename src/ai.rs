@@ -35,6 +35,7 @@ impl Claude {
         match self.backend() {
             "codex" | "openai" => &self.cfg.openai_model,
             "gemini" | "gemini-api" => &self.cfg.gemini_model,
+            "grok" | "xai" => &self.cfg.grok_model,
             _ => &self.cfg.model,
         }
     }
@@ -56,6 +57,8 @@ impl Claude {
             "openai" => self.via_openai(system, prompt, schema),
             "gemini" => self.via_gemini_cli(system, prompt, schema),
             "gemini-api" => self.via_gemini_api(system, prompt, schema),
+            "grok" => self.via_grok_cli(system, prompt, schema),
+            "xai" => self.via_xai(system, prompt, schema),
             _ => self.via_cli(system, prompt, schema),
         }
     }
@@ -213,6 +216,66 @@ impl Claude {
     }
 }
 
+impl Claude {
+    fn via_grok_cli(&self, system: &str, prompt: &str, schema: &Value) -> Result<Value> {
+        let mut cmd = Command::new("grok");
+        cmd.args(["--output-format", "json", "--tools", "", "--disable-web-search", "--no-subagents"])
+            .args(["--json-schema", &schema.to_string()])
+            .args(["--system-prompt-override", system]);
+        if !self.cfg.grok_model.is_empty() {
+            cmd.args(["-m", &self.cfg.grok_model]);
+        }
+        if let Some(k) = key(&self.cfg.xai_key, "XAI_API_KEY") {
+            cmd.env("XAI_API_KEY", k);
+        }
+        let out = cmd
+            .arg("-p")
+            .arg(prompt)
+            .current_dir(std::env::temp_dir())
+            .stdin(Stdio::null())
+            .output()
+            .context("running `grok` — is the Grok CLI installed?")?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        // One JSON object (or a few JSON lines): an error, or the reply in one of these fields.
+        for line in text.lines().rev().chain(std::iter::once(text.as_ref())) {
+            let Ok(v) = serde_json::from_str::<Value>(line.trim()) else { continue };
+            if v["type"] == "error" || v["is_error"] == true {
+                bail!("Grok: {}", v["message"].as_str().or(v["result"].as_str()).unwrap_or("unknown error"));
+            }
+            for k in ["structured_output", "structuredOutput", "output"] {
+                if v[k].is_object() {
+                    return Ok(v[k].clone());
+                }
+            }
+            for k in ["result", "text", "response", "content"] {
+                if let Some(t) = v[k].as_str() {
+                    return parse_json(t, "Grok");
+                }
+            }
+            if v.is_object() && v.get("type").is_none() {
+                return Ok(v);
+            }
+        }
+        if !out.status.success() {
+            bail!("Grok CLI failed ({}): {}", out.status, tail(&out.stderr));
+        }
+        parse_json(&text, "Grok")
+    }
+
+    fn via_xai(&self, system: &str, prompt: &str, schema: &Value) -> Result<Value> {
+        let key = key(&self.cfg.xai_key, "XAI_API_KEY").ok_or_else(|| anyhow!("the xAI API needs a key — add one in Settings → AI assistant"))?;
+        let model = if self.cfg.grok_model.is_empty() { DEFAULT_GROK_MODEL } else { &self.cfg.grok_model };
+        let body = json!({
+            "model": model,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+            "response_format": {"type": "json_schema", "json_schema": {"name": "reply", "schema": schema, "strict": true}},
+        });
+        let v = post_json(ureq::post("https://api.x.ai/v1/chat/completions").set("Authorization", &format!("Bearer {key}")), body, "xAI API")?;
+        parse_json(v["choices"][0]["message"]["content"].as_str().unwrap_or_default(), "Grok")
+    }
+}
+
+const DEFAULT_GROK_MODEL: &str = "grok-4";
 const DEFAULT_OPENAI_MODEL: &str = "gpt-5";
 const DEFAULT_GEMINI_MODEL: &str = "gemini-2.5-pro";
 
@@ -232,6 +295,8 @@ pub const PROVIDERS: &[Provider] = &[
     Provider { id: "openai", name: "OpenAI · API key", how: "pay as you go with an OpenAI API key" },
     Provider { id: "gemini", name: "Gemini · Gemini CLI", how: "signs in with your Google account" },
     Provider { id: "gemini-api", name: "Gemini · API key", how: "a Google AI Studio API key" },
+    Provider { id: "grok", name: "Grok · Grok CLI", how: "your Grok / X account (or an xAI key)" },
+    Provider { id: "xai", name: "Grok · xAI API key", how: "pay as you go with an xAI API key" },
 ];
 
 pub fn provider(id: &str) -> &'static Provider {
@@ -244,6 +309,7 @@ pub fn key_field(id: &str) -> Option<&'static str> {
         "api" => Some("anthropic_key"),
         "openai" => Some("openai_key"),
         "gemini-api" => Some("gemini_key"),
+        "xai" => Some("xai_key"),
         _ => None,
     }
 }
@@ -255,6 +321,7 @@ pub fn sign_in_command(id: &str) -> Option<(&'static str, &'static [&'static str
         "codex" => Some(("codex", &["login"])),
         // The Gemini CLI signs in on its first interactive run (pick "Sign in with Google", then /quit).
         "gemini" => Some(("gemini", &[])),
+        "grok" => Some(("grok", &["login"])),
         _ => None,
     }
 }
@@ -277,6 +344,10 @@ pub fn ready(id: &str, cfg: &config::Claude) -> Result<bool, String> {
         "gemini" if !on_path("gemini") => Err("the Gemini CLI isn't installed (npm i -g @google/gemini-cli)".into()),
         "gemini" => Ok(dirs::home_dir().is_some_and(|h| h.join(".gemini/oauth_creds.json").exists())
             || key(&cfg.gemini_key, "GEMINI_API_KEY").is_some()),
+        // No status command, so look for saved credentials under ~/.grok.
+        "grok" if !on_path("grok") => Err("the Grok CLI isn't installed (npm i -g @xai-official/grok)".into()),
+        "grok" => Ok(key(&cfg.xai_key, "XAI_API_KEY").is_some() || grok_signed_in()),
+        "xai" => Ok(key(&cfg.xai_key, "XAI_API_KEY").is_some()),
         "api" => Ok(key(&cfg.anthropic_key, "ANTHROPIC_API_KEY").is_some()),
         "openai" => Ok(key(&cfg.openai_key, "OPENAI_API_KEY").is_some()),
         "gemini-api" => Ok(key(&cfg.gemini_key, "GEMINI_API_KEY").is_some()),
@@ -290,6 +361,14 @@ pub fn ready_all(cfg: &config::Claude) -> Vec<Result<bool, String>> {
         let hs: Vec<_> = PROVIDERS.iter().map(|p| s.spawn(move || ready(p.id, cfg))).collect();
         hs.into_iter().map(|h| h.join().unwrap_or(Ok(false))).collect()
     })
+}
+
+fn grok_signed_in() -> bool {
+    let Some(home) = dirs::home_dir() else { return false };
+    let looks_like_auth = |n: &str| ["auth", "cred", "token", "session.json", "login"].iter().any(|k| n.to_lowercase().contains(k));
+    std::fs::read_dir(home.join(".grok"))
+        .map(|d| d.flatten().any(|e| e.file_type().is_ok_and(|t| t.is_file()) && looks_like_auth(&e.file_name().to_string_lossy())))
+        .unwrap_or(false)
 }
 
 fn on_path(prog: &str) -> bool {
