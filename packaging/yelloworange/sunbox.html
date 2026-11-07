@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sunbox · YellowOrange</title>
+  <meta name="description" content="Sunbox: Gmail in your terminal, with an AI assistant that sorts your mail, drafts replies and gives each email one-press buttons. How to install and use it." />
+  <link rel="icon" href="/assets/sunbox.svg" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700;800;900&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/assets/styles.css" />
+  <style>
+    .page-hero.wrap { padding-left: var(--pad); padding-right: var(--pad); }
+    .sb-section p a { text-decoration: underline; font-weight: 700; }
+    .sb-logo { width: 84px; height: 84px; border-radius: 20px; display: block; margin: 0 0 18px; }
+    .sb-section { padding: 34px 0 6px; border-top: 2px solid var(--line-strong); margin-top: 34px; }
+    .sb-section h2 { font-size: clamp(26px, 4vw, 40px); font-weight: 900; text-transform: uppercase;
+      letter-spacing: -.01em; margin: 0 0 14px; line-height: 1; }
+    .sb-section h3 { font-size: 19px; font-weight: 800; margin: 26px 0 8px; }
+    .sb-section p, .sb-section li { font-size: 17px; font-weight: 500; max-width: 68ch; line-height: 1.55; }
+    .sb-section ol, .sb-section ul { padding-left: 1.3em; margin: 0 0 14px; }
+    .sb-section li { margin: 6px 0; }
+    .sb-cmd { position: relative; background: var(--ink); color: var(--paper); border-radius: var(--radius);
+      padding: 18px 92px 18px 20px; margin: 12px 0 16px; max-width: 900px;
+      font: 600 15px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .sb-cmd .c { color: var(--gold-bright); }
+    .sb-copy { position: absolute; top: 12px; right: 12px; border: 0; border-radius: 999px; cursor: pointer;
+      background: var(--gold); color: var(--ink); font: 700 13px var(--font); padding: 7px 14px; }
+    .sb-copy:hover { background: var(--paper); }
+    code { font: 600 .92em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: rgba(22,23,15,.08);
+      padding: 1px 6px; border-radius: 6px; }
+    kbd { font: 700 14px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: var(--paper);
+      border: 2px solid var(--ink); border-radius: 7px; padding: 1px 7px; box-shadow: 0 2px 0 var(--ink); white-space: nowrap; }
+    .sb-keys { border-collapse: collapse; width: 100%; max-width: 900px; margin: 6px 0 14px; }
+    .sb-keys td { padding: 9px 12px 9px 0; border-bottom: 1px solid var(--line); font-size: 16px; font-weight: 500; vertical-align: top; }
+    .sb-keys td:first-child { width: 150px; }
+    .sb-note { background: var(--gold); border-radius: var(--radius); padding: 16px 20px; max-width: 900px;
+      font-size: 16px; font-weight: 600; margin: 14px 0; }
+    .sb-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; max-width: 900px; margin: 10px 0 14px; }
+    .sb-card { border: 2px solid var(--ink); border-radius: var(--radius); padding: 14px 16px; background: var(--paper); }
+    .sb-card b { display: block; font-size: 17px; margin-bottom: 4px; }
+    .sb-card span { font-size: 15px; font-weight: 500; color: var(--ink-soft); }
+    @media (max-width: 640px) {
+      .sb-cmd { padding-right: 20px; padding-top: 50px; }
+      .sb-keys td:first-child { width: 110px; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar solid wrap">
+    <a class="brand" href="/">
+      <img src="/assets/logo.png" alt="YellowOrange" /> YellowOrange
+      <span class="tag">A little slice of fun</span>
+    </a>
+    <nav class="nav">
+      <a href="/apps.html">Apps</a>
+      <a href="/studio.html">Studio</a>
+      <a href="/endpin.html">Endpin</a>
+      <a href="/design.html">Design</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="page-hero wrap">
+      <img class="sb-logo" src="/assets/sunbox.svg" alt="Sunbox logo" />
+      <span class="kicker">•• Apps · Beta ••</span>
+      <h1>Sunbox</h1>
+      <p class="lede">Your inbox, at sunrise. Gmail in your terminal, with an AI assistant that sorts your mail, drafts your replies and gives every email a one-press next step.</p>
+    </section>
+
+    <section class="wrap">
+      <p class="page-p">Sunbox is the email app I use every day. It's fast and keyboard-first, and it runs in the Terminal on a Mac or Linux. Pick the AI assistant you already pay for (Claude, ChatGPT, Gemini or Grok). It reads your inbox, sorts it into categories that fit your mail, and writes a draft for everything that needs a reply. Nothing is ever sent until you've checked it.</p>
+      <div class="panel-actions">
+        <a class="btn btn-primary" href="#install">Install it →</a>
+        <a class="btn btn-ghost" href="https://github.com/bramwellfreeman/sunbox" target="_blank" rel="noopener">Source on GitHub</a>
+      </div>
+
+      <!-- 1. Install -->
+      <div class="sb-section" id="install">
+        <h2>1 · Install</h2>
+        <p>Open <b>Terminal</b> (on a Mac: press <kbd>⌘ Space</kbd>, type “Terminal”, press Return), paste this line and press Return:</p>
+        <div class="sb-cmd"><button class="sb-copy" type="button">Copy</button>curl -fsSL https://github.com/bramwellfreeman/sunbox/releases/latest/download/install.sh | sh</div>
+        <p>It downloads Sunbox for your computer (Apple Silicon and Intel Macs, or 64-bit Linux), puts it in <code>~/.local/bin</code>, and sets up your Terminal so the <code>sunbox</code> command works. <b>Then close that Terminal window and open a new one.</b></p>
+        <p>Rather download it yourself? <a href="https://github.com/bramwellfreeman/sunbox/releases/latest/download/sunbox-macos-universal.tar.gz">Mac download</a> · <a href="https://github.com/bramwellfreeman/sunbox/releases/latest/download/sunbox-linux-x86_64.tar.gz">Linux download</a>. A Mac blocks apps downloaded in the browser until you approve them, so the Terminal line above is the easy way.</p>
+      </div>
+
+      <!-- 2. Sign in -->
+      <div class="sb-section" id="sign-in">
+        <h2>2 · Sign in to Gmail</h2>
+        <div class="sb-note">Sunbox is in beta. Google only lets invited testers sign in for now, so ask me for an invite first. With it you'll get the sign-in key used below.</div>
+        <ol>
+          <li>Give Sunbox the sign-in key from your invite:
+            <div class="sb-cmd"><button class="sb-copy" type="button">Copy</button>sunbox auth setup</div></li>
+          <li>Sign in with Google. Your browser opens, so pick your Gmail account. If Google says the app isn't verified, click <b>Advanced → Continue</b>.
+            <div class="sb-cmd"><button class="sb-copy" type="button">Copy</button>sunbox auth login</div></li>
+          <li>Open your inbox:
+            <div class="sb-cmd"><button class="sb-copy" type="button">Copy</button>sunbox</div></li>
+        </ol>
+        <p>Your mail goes straight between your computer and Gmail. Everything else (your contacts, templates and settings) stays on your computer.</p>
+      </div>
+
+      <!-- 3. Use it -->
+      <div class="sb-section" id="use">
+        <h2>3 · Find your way around</h2>
+        <p>Sunbox runs on the keyboard, but you can also click: click a row to select it, double-click to open it, and scroll with the wheel. Press <kbd>?</kbd> anytime to see every key.</p>
+        <table class="sb-keys">
+          <tr><td><kbd>1</kbd>–<kbd>7</kbd> · <kbd>Tab</kbd></td><td>Switch tabs: To do, Primary, Starred, Newsletters, All, Sent, ✦ Claude</td></tr>
+          <tr><td><kbd>j</kbd> <kbd>k</kbd> · <kbd>↑</kbd> <kbd>↓</kbd></td><td>Move up and down</td></tr>
+          <tr><td><kbd>Return</kbd></td><td>Open an email (<kbd>Esc</kbd> goes back)</td></tr>
+          <tr><td><kbd>c</kbd></td><td>Write a new email. Start typing a name in To and pick from the suggestions</td></tr>
+          <tr><td><kbd>r</kbd> · <kbd>f</kbd></td><td>Reply · forward</td></tr>
+          <tr><td><kbd>Ctrl S</kbd> · <kbd>Ctrl D</kbd></td><td>In the composer: send · save as a Gmail draft</td></tr>
+          <tr><td><kbd>e</kbd> · <kbd>s</kbd> · <kbd>l</kbd></td><td>Archive · star · add a label</td></tr>
+          <tr><td><kbd>/</kbd></td><td>Search, with Gmail search words like <code>from:jane</code> or <code>newer_than:7d</code></td></tr>
+          <tr><td><kbd>C</kbd></td><td>Find a contact and write to them</td></tr>
+          <tr><td><kbd>,</kbd> or <b>⚙</b></td><td>Settings: your accounts and your AI assistant</td></tr>
+          <tr><td><kbd>q</kbd></td><td>Quit</td></tr>
+        </table>
+        <p>Got more than one Gmail account? Open <b>⚙ → Accounts</b> to add another, switch between them, or tick a few to show their inboxes together.</p>
+      </div>
+
+      <!-- 4. AI assistant -->
+      <div class="sb-section" id="assistant">
+        <h2>4 · Your AI assistant</h2>
+        <p>Open <b>⚙ → AI assistant</b> and choose the one you already use. Press <kbd>Return</kbd> on it to sign in, then <kbd>t</kbd> to check it answers.</p>
+        <div class="sb-grid">
+          <div class="sb-card"><b>Claude</b><span>Sign in with your Claude plan (Claude Code), or paste an Anthropic API key</span></div>
+          <div class="sb-card"><b>ChatGPT</b><span>Sign in with your ChatGPT plan (Codex CLI), or paste an OpenAI API key</span></div>
+          <div class="sb-card"><b>Gemini</b><span>Sign in with Google (Gemini CLI), or paste a Google AI Studio key</span></div>
+          <div class="sb-card"><b>Grok</b><span>Sign in with your Grok account (Grok CLI), or paste an xAI API key</span></div>
+        </div>
+        <p>The plan-based options need that company's command-line tool installed first (Claude Code, Codex, Gemini CLI or Grok CLI). The API-key options need nothing else.</p>
+        <p>Then open the <b>✦ Claude</b> tab (key <kbd>7</kbd>; it keeps that name whichever assistant you pick). The assistant reads your inbox and:</p>
+        <ul>
+          <li><b>Sorts it</b> into categories that fit your mail (Clients, Bills, School…), with the most urgent email first and a one-line reason for each.</li>
+          <li><b>Drafts a reply</b> to every email that needs one. Press <kbd>Return</kbd> to check it, edit anything, then <kbd>Ctrl S</kbd> to send. <kbd>w</kbd> redrafts it with your instructions (“decline politely”).</li>
+          <li><b>Adds buttons</b> for emails that need something other than a reply. Press <kbd>Space</kbd> to see them: add to Google Calendar, add a TickTick task, open the link the email is about, unsubscribe, archive, label or forward.</li>
+          <li><b>Files your mail</b> into Gmail labels named after the categories when you press <kbd>F</kbd>, so the sorting shows up on your phone too.</li>
+        </ul>
+        <p>Press <kbd>R</kbd> to have it read your inbox again.</p>
+      </div>
+
+      <!-- 5. Extras -->
+      <div class="sb-section" id="extras">
+        <h2>5 · Updates &amp; extras</h2>
+        <h3>Update</h3>
+        <p>Run the install line again. It replaces Sunbox with the newest version and keeps your accounts and settings.</p>
+        <h3>From the command line</h3>
+        <p>Every feature also works as a plain command, which is handy for scripts and AI agents: <code>sunbox inbox</code>, <code>sunbox search "from:jane"</code>, <code>sunbox contacts find ross</code>, <code>sunbox claude brief</code>. Add <code>--json</code> for machine-readable output, or run <code>sunbox --help</code> to see them all.</p>
+        <h3>Uninstall</h3>
+        <p>Delete the app, plus its settings and data if you want those gone too:</p>
+        <div class="sb-cmd"><button class="sb-copy" type="button">Copy</button><span class="c"># Mac</span>
+rm ~/.local/bin/sunbox
+rm -rf ~/Library/Application\ Support/sunbox
+<span class="c"># Linux</span>
+rm ~/.local/bin/sunbox
+rm -rf ~/.config/sunbox ~/.local/share/sunbox</div>
+      </div>
+
+      <div class="panel-actions" style="margin: 30px 0 10px">
+        <a class="btn btn-primary" href="#install">Install Sunbox →</a>
+        <a class="btn btn-ghost" href="/apps.html">← All apps</a>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-foot">
+    <div class="wrap">
+      <div class="links">
+        <a href="/">Home</a>
+        <a href="/apps.html">Apps</a>
+        <a href="/endpin.html">Endpin</a>
+        <a href="/design.html">Design</a>
+        <a href="https://instagram.com/bramwellfreeman" target="_blank" rel="noopener">Instagram</a>
+      </div>
+      <small>© <span id="year"></span> YellowOrange · A little slice of fun</small>
+    </div>
+  </footer>
+
+  <script>
+    document.getElementById("year").textContent = new Date().getFullYear();
+    // Copy buttons copy the command text (minus the button label and # comments).
+    document.querySelectorAll(".sb-copy").forEach((b) => {
+      b.addEventListener("click", async () => {
+        const box = b.parentElement.cloneNode(true);
+        box.querySelector(".sb-copy").remove();
+        box.querySelectorAll(".c").forEach((c) => c.remove());
+        const text = box.textContent.split("\n").map((l) => l.trim()).filter(Boolean).join("\n");
+        try {
+          await navigator.clipboard.writeText(text);
+          b.textContent = "Copied ✓";
+        } catch {
+          b.textContent = "Select & copy";
+        }
+        setTimeout(() => (b.textContent = "Copy"), 1800);
+      });
+    });
+  </script>
+</body>
+</html>
